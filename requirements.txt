@@ -1,0 +1,8 @@
+requests
+python-telegram-bot
+pandas
+numpy
+tradingview-ta
+ccxt
+MetaTrader5
+pandas-ta
