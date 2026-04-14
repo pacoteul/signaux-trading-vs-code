@@ -344,6 +344,93 @@ def detect_fvg(current_price, indicators, zones):
     return indicators.get('FVG', None)
 
 
+def detect_wyckoff_phase(df, indicators):
+    """
+    Détecte les phases et événements Wyckoff clés sur les données OHLCV.
+
+    Événements détectés :
+    - Spring (Accumulation)       : faux cassage sous le support → retournement haussier
+    - Selling Climax / SC         : bougie baissière large + volume élevé aux bas → épuisement vendeurs
+    - Upthrust / UT               : faux cassage au-dessus de la résistance → retournement baissier
+    - Buying Climax / BC          : bougie haussière large + volume élevé aux hauts → épuisement acheteurs
+    - Sign of Strength / SOS      : cassage de résistance + volume → continuation haussière
+    - Sign of Weakness / SOW      : cassage de support + volume → continuation baissière
+
+    Retourne un dict {'phase', 'event', 'wyckoff_bias': 'BUY'|'SELL'|'NEUTRAL'}
+    """
+    if len(df) < 21:
+        return {'phase': None, 'event': None, 'wyckoff_bias': 'NEUTRAL'}
+
+    close = df['close']
+    high_col = df['high']
+    low_col = df['low']
+    open_col = df['open']
+    volume = df['tick_volume']
+
+    curr_close = close.iloc[-1]
+    curr_open = open_col.iloc[-1]
+    curr_high = high_col.iloc[-1]
+    curr_low = low_col.iloc[-1]
+    curr_volume = volume.iloc[-1]
+
+    # Volume moyen sur 20 bougies (hors bougie courante)
+    avg_volume = volume.iloc[-21:-1].mean()
+    high_volume = curr_volume > avg_volume * 1.5 if avg_volume > 0 else False
+
+    # Range des 20 bougies précédentes
+    recent_high = high_col.iloc[-21:-1].max()
+    recent_low = low_col.iloc[-21:-1].min()
+    trend_range = recent_high - recent_low if recent_high > recent_low else 1e-9
+
+    # Position du prix dans le range (0 = bas, 1 = haut)
+    price_position = max(0.0, min(1.0, (curr_close - recent_low) / trend_range))
+
+    # Caractéristiques de la bougie courante
+    candle_range = curr_high - curr_low
+    atr = indicators.get('ATR') or (trend_range / 10)
+    is_large_candle = candle_range > atr * 1.3
+    is_bullish = curr_close > curr_open
+    is_bearish = curr_close < curr_open
+
+    # Contexte de tendance via EMA
+    ema20 = indicators.get('EMA20')
+    ema50 = indicators.get('EMA50')
+    in_downtrend = bool(ema20 and ema50 and curr_close < ema20 and ema20 < ema50)
+    in_uptrend = bool(ema20 and ema50 and curr_close > ema20 and ema20 > ema50)
+
+    # --- SPRING (Accumulation) ---
+    # La bougie plonge sous le support récent puis remonte au-dessus → shakeout classique
+    if curr_low < recent_low and curr_close > recent_low and is_bullish:
+        return {'phase': 'Accumulation', 'event': 'Spring', 'wyckoff_bias': 'BUY'}
+
+    # --- SELLING CLIMAX (SC) ---
+    # Grande bougie baissière avec volume élevé en bas de range + tendance baissière
+    if price_position < 0.25 and is_bearish and is_large_candle and high_volume and in_downtrend:
+        return {'phase': 'Accumulation', 'event': 'Selling Climax (SC)', 'wyckoff_bias': 'BUY'}
+
+    # --- UPTHRUST (UT / Distribution) ---
+    # La bougie perce au-dessus de la résistance récente puis clôture en dessous → bull trap
+    if curr_high > recent_high and curr_close < recent_high and is_bearish:
+        return {'phase': 'Distribution', 'event': 'Upthrust (UT)', 'wyckoff_bias': 'SELL'}
+
+    # --- BUYING CLIMAX (BC) ---
+    # Grande bougie haussière avec volume élevé en haut de range + tendance haussière
+    if price_position > 0.75 and is_bullish and is_large_candle and high_volume and in_uptrend:
+        return {'phase': 'Distribution', 'event': 'Buying Climax (BC)', 'wyckoff_bias': 'SELL'}
+
+    # --- SIGN OF STRENGTH (SOS) ---
+    # Clôture au-dessus de la résistance récente + volume élevé + tendance haussière
+    if curr_close > recent_high and is_bullish and high_volume and in_uptrend:
+        return {'phase': 'Markup', 'event': 'Sign of Strength (SOS)', 'wyckoff_bias': 'BUY'}
+
+    # --- SIGN OF WEAKNESS (SOW) ---
+    # Clôture en dessous du support récent + volume élevé + tendance baissière
+    if curr_close < recent_low and is_bearish and high_volume and in_downtrend:
+        return {'phase': 'Markdown', 'event': 'Sign of Weakness (SOW)', 'wyckoff_bias': 'SELL'}
+
+    return {'phase': None, 'event': None, 'wyckoff_bias': 'NEUTRAL'}
+
+
 def get_target_levels(entry, sl, direction):
     distance = abs(entry - sl)
     if distance == 0:
@@ -446,12 +533,22 @@ def compute_pair_score(pair_results):
         bonus += 10
     if any(r['fvg'] for r in pair_results):
         bonus += 8
+
+    # Wyckoff: +15 si un événement confirme la direction, -10 s'il contredit
+    wyckoff_aligned = [r['wyckoff'] for r in pair_results
+                       if r.get('wyckoff') and r['wyckoff']['wyckoff_bias'] == direction]
+    wyckoff_opposed = [r['wyckoff'] for r in pair_results
+                       if r.get('wyckoff') and r['wyckoff']['wyckoff_bias'] not in ('NEUTRAL', direction)]
+    if wyckoff_aligned:
+        bonus += 15
     score += bonus
 
     if any(r['recommendation'] == direction for r in pair_results if direction != 'NEUTRAL'):
         score += 5
     if any(r['recommendation'] == 'NEUTRAL' for r in pair_results):
         score -= 5
+    if wyckoff_opposed and not wyckoff_aligned:
+        score -= 10
 
     score = max(min(score, 100), 10)
     if direction == 'NEUTRAL' and score > 55:
@@ -487,8 +584,12 @@ def compute_pair_score(pair_results):
         rationale.append('Confluence S/R')
     if any(r['fvg'] for r in pair_results):
         rationale.append('FVG')
+    if wyckoff_aligned:
+        rationale.append(f"Wyckoff {wyckoff_aligned[0]['event']}")
+    elif wyckoff_opposed:
+        rationale.append(f"Wyckoff contre-signal: {wyckoff_opposed[0]['event']}")
 
-    return direction, score, ' ; '.join(rationale[:3])
+    return direction, score, ' ; '.join(rationale[:4])
 
 
 def scan_signals_headless():
@@ -531,6 +632,7 @@ def scan_signals_headless():
                 zones = detect_support_resistance(current_price, indicators)
                 ob = detect_order_block(indicators, current_price, zones)
                 fvg = detect_fvg(current_price, indicators, zones)
+                wyckoff = detect_wyckoff_phase(df, indicators)
 
                 pair_results.append({
                     'tf': tf,
@@ -538,7 +640,8 @@ def scan_signals_headless():
                     'psych': psych,
                     'ob': ob,
                     'zones': zones,
-                    'fvg': fvg
+                    'fvg': fvg,
+                    'wyckoff': wyckoff
                 })
 
                 time.sleep(API_REQUEST_DELAY)
