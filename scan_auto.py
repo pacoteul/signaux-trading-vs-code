@@ -68,6 +68,10 @@ TELEGRAM_BOT_TOKEN = CREDS['TELEGRAM_BOT_TOKEN']
 TELEGRAM_CHAT_ID = CREDS['TELEGRAM_CHAT_ID']
 
 from tradingview_ta import Interval
+from history_stats import load_stats, get_historical_adjustment
+
+# Load historical stats once at startup (empty dict if file not yet generated)
+HIST_STATS = load_stats()
 
 PAIRS = [
     "EURUSD", "EURGBP", "EURCAD", "EURJPY", "EURCHF", "EURAUD", "EURNZD",
@@ -911,23 +915,37 @@ def scan_signals_headless():
 
             direction, score, rationale = compute_pair_score(pair_results)
 
+            # Collect best SMC data (needed for SL/TP AND historical adjustment)
+            best_true_ob   = next((r['true_ob']  for r in pair_results if r.get('true_ob')),  None)
+            best_liquidity = next((r['liquidity'] for r in pair_results
+                                   if r.get('liquidity') and r['liquidity'].get('bsl')), None)
+            best_pd = next((r['premium_discount'] for r in pair_results
+                            if r.get('premium_discount') and r['premium_discount']['zone'] != 'NEUTRAL'), None)
+
             # Kill Zone : +5 pts si signal pendant une fenêtre institutionnelle
             kz = is_kill_zone()
             if kz['active'] and direction != 'NEUTRAL':
                 score = min(score + 5, 100)
+
+            # Historical adjustment: empirical probability layer from 10 years of data
+            # Boosts/penalises the technical score based on how price has historically
+            # behaved at this level, kill zone, P/D zone, and FVG for this pair.
+            hist_adj = get_historical_adjustment(
+                pair, last_current_price, best_pd, kz,
+                direction, HIST_STATS,
+                has_fvg=any(r['fvg'] for r in pair_results)
+            )
+            if hist_adj != 0:
+                score = max(min(score + hist_adj, 100), 20)
+                logger.info(f"{pair} - Historical adjustment: {hist_adj:+d} → score {score}")
 
             if score < 68:
                 logger.info(f"{pair} - Score {score} below threshold (68)")
                 continue
 
             logger.info(f"{pair} - SIGNAL DETECTED: {direction} {score}/100"
-                        + (f" [{kz['name']}]" if kz['active'] else ""))
-
-            best_true_ob   = next((r['true_ob']  for r in pair_results if r.get('true_ob')),  None)
-            best_liquidity = next((r['liquidity'] for r in pair_results
-                                   if r.get('liquidity') and r['liquidity'].get('bsl')), None)
-            best_pd = next((r['premium_discount'] for r in pair_results
-                            if r.get('premium_discount') and r['premium_discount']['zone'] != 'NEUTRAL'), None)
+                        + (f" [{kz['name']}]" if kz['active'] else "")
+                        + (f" [hist {hist_adj:+d}]" if hist_adj != 0 else ""))
 
             sl, levels = choose_levels(last_current_price, direction, last_indicators,
                                        smc_data={'true_ob': best_true_ob, 'liquidity': best_liquidity})
