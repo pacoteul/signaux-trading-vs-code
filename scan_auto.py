@@ -68,6 +68,10 @@ TELEGRAM_BOT_TOKEN = CREDS['TELEGRAM_BOT_TOKEN']
 TELEGRAM_CHAT_ID = CREDS['TELEGRAM_CHAT_ID']
 
 from tradingview_ta import Interval
+from history_stats import load_stats, get_historical_adjustment
+
+# Load historical stats once at startup (empty dict if file not yet generated)
+HIST_STATS = load_stats()
 
 PAIRS = [
     "EURUSD", "EURGBP", "EURCAD", "EURJPY", "EURCHF", "EURAUD", "EURNZD",
@@ -150,7 +154,7 @@ def is_psychological_level(price, pair):
     }
     pair_levels = levels.get(pair, [])
     for level in pair_levels:
-        if abs(price - level) < 0.001:  # Tolerance
+        if abs(price - level) / max(level, 0.0001) < 0.001:  # Relative tolerance 0.1%
             return True
     return False
 
@@ -173,9 +177,10 @@ def compute_indicators(df):
     indicators['low'] = df['low'].iloc[-1]
     indicators['volume'] = df['tick_volume'].iloc[-1]
 
-    # RSI
+    # RSI — current and previous bar for reversal/divergence detection
     rsi = ta.rsi(df['close'], length=14)
-    indicators['RSI'] = rsi.iloc[-1] if not rsi.empty else 50
+    indicators['RSI'] = float(rsi.iloc[-1]) if len(rsi) > 0 and pd.notna(rsi.iloc[-1]) else 50
+    indicators['RSI_prev'] = float(rsi.iloc[-2]) if len(rsi) > 1 and pd.notna(rsi.iloc[-2]) else 50
 
     # MACD
     macd = ta.macd(df['close'])
@@ -185,16 +190,14 @@ def compute_indicators(df):
     stoch = ta.stoch(df['high'], df['low'], df['close'])
     indicators['Stoch.K'] = stoch['STOCHk_14_3_3'].iloc[-1] if 'STOCHk_14_3_3' in stoch.columns else 50
 
-    # Pivot points - Manual calculation
-    high = df['high'].iloc[-1]
-    low = df['low'].iloc[-1]
-    close = df['close'].iloc[-1]
-    pivot = (high + low + close) / 3
-    r1 = (2 * pivot) - low
-    s1 = (2 * pivot) - high
-    r2 = pivot + (high - low)
-    s2 = pivot - (high - low)
-    
+    # Pivot points — use last COMPLETE candle (iloc[-2]), not the forming one
+    prev = df.iloc[-2] if len(df) >= 2 else df.iloc[-1]
+    pivot = (prev['high'] + prev['low'] + prev['close']) / 3
+    r1 = (2 * pivot) - prev['low']
+    s1 = (2 * pivot) - prev['high']
+    r2 = pivot + (prev['high'] - prev['low'])
+    s2 = pivot - (prev['high'] - prev['low'])
+
     indicators['Pivot.M.Classic.Middle'] = pivot
     indicators['Pivot.M.Classic.R1'] = r1
     indicators['Pivot.M.Classic.S1'] = s1
@@ -205,6 +208,31 @@ def compute_indicators(df):
     adx = ta.adx(df['high'], df['low'], df['close'])
     indicators['ADX'] = adx['ADX_14'].iloc[-1] if 'ADX_14' in adx.columns else 20
 
+    # ATR for volatility-based stop loss
+    atr = ta.atr(df['high'], df['low'], df['close'], length=14)
+    indicators['ATR'] = float(atr.iloc[-1]) if atr is not None and len(atr) > 0 and pd.notna(atr.iloc[-1]) else None
+
+    # EMA trend filter (20 and 50 period)
+    ema20 = ta.ema(df['close'], length=20)
+    ema50 = ta.ema(df['close'], length=50)
+    indicators['EMA20'] = float(ema20.iloc[-1]) if ema20 is not None and len(ema20) > 0 and pd.notna(ema20.iloc[-1]) else None
+    indicators['EMA50'] = float(ema50.iloc[-1]) if ema50 is not None and len(ema50) > 0 and pd.notna(ema50.iloc[-1]) else None
+
+    # Fair Value Gap — genuine 3-candle gap analysis
+    if len(df) >= 3:
+        c1_high = df['high'].iloc[-3]
+        c1_low = df['low'].iloc[-3]
+        c3_high = df['high'].iloc[-1]
+        c3_low = df['low'].iloc[-1]
+        if c3_low > c1_high:
+            indicators['FVG'] = 'Bullish FVG'
+        elif c3_high < c1_low:
+            indicators['FVG'] = 'Bearish FVG'
+        else:
+            indicators['FVG'] = None
+    else:
+        indicators['FVG'] = None
+
     return indicators
 
 
@@ -213,6 +241,9 @@ def compute_recommendation(indicators):
     macd_hist = indicators.get('MACD.hist', 0)
     stoch_k = indicators.get('Stoch.K', 50)
     adx = indicators.get('ADX', 20)
+    close = indicators.get('close')
+    ema20 = indicators.get('EMA20')
+    ema50 = indicators.get('EMA50')
 
     buy_signals = 0
     sell_signals = 0
@@ -231,6 +262,13 @@ def compute_recommendation(indicators):
         buy_signals += 1
     elif stoch_k > 80:
         sell_signals += 1
+
+    # EMA trend alignment: price position relative to both EMAs confirms trend
+    if close and ema20 and ema50:
+        if close > ema20 > ema50:
+            buy_signals += 1
+        elif close < ema20 < ema50:
+            sell_signals += 1
 
     if adx > 25:
         if buy_signals > sell_signals:
@@ -261,22 +299,26 @@ def get_momentum(indicators):
 def detect_order_block(indicators, current_price, zones):
     momentum = get_momentum(indicators)
     rsi = momentum['rsi']
-    macd_hist = momentum['macd_hist']
-    ob = None
+    rsi_prev = indicators.get('RSI_prev', 50)
 
-    strong_support = 'Support' in zones or 'Pivot' in zones
-    strong_resistance = 'Resistance' in zones or 'Pivot' in zones
+    # zones contains strings like 'Support S1', 'Resistance R1', 'Pivot' — use substring match
+    strong_support = any('Support' in z for z in zones) or any('Pivot' in z for z in zones)
+    strong_resistance = any('Resistance' in z for z in zones) or any('Pivot' in z for z in zones)
 
-    if rsi < 35 and (strong_support or macd_hist < 0):
-        ob = 'Bullish OB'
-    elif rsi > 65 and (strong_resistance or macd_hist > 0):
-        ob = 'Bearish OB'
-    elif rsi < 30 and indicators.get('RSI[1]', 50) > rsi:
-        ob = 'Bullish OB'
-    elif rsi > 70 and indicators.get('RSI[1]', 50) < rsi:
-        ob = 'Bearish OB'
+    # Bullish OB: oversold at support zone
+    if rsi < 35 and strong_support:
+        return 'Bullish OB'
+    # Bearish OB: overbought at resistance zone
+    if rsi > 65 and strong_resistance:
+        return 'Bearish OB'
+    # Bullish OB: RSI recovering from oversold (rsi_prev < rsi = RSI rising)
+    if rsi < 40 and rsi_prev < rsi:
+        return 'Bullish OB'
+    # Bearish OB: RSI falling from overbought (rsi_prev > rsi = RSI falling)
+    if rsi > 60 and rsi_prev > rsi:
+        return 'Bearish OB'
 
-    return ob
+    return None
 
 
 def detect_support_resistance(current_price, indicators):
@@ -302,28 +344,260 @@ def detect_support_resistance(current_price, indicators):
 
 
 def detect_fvg(current_price, indicators, zones):
-    pivot = indicators.get('Pivot.M.Classic.Middle', None)
-    r1 = indicators.get('Pivot.M.Classic.R1', None)
-    s1 = indicators.get('Pivot.M.Classic.S1', None)
-    r2 = indicators.get('Pivot.M.Classic.R2', None)
-    s2 = indicators.get('Pivot.M.Classic.S2', None)
-    if pivot is None:
+    # Use genuine 3-candle gap analysis pre-calculated in compute_indicators
+    return indicators.get('FVG', None)
+
+
+def detect_wyckoff_phase(df, indicators):
+    """
+    Détecte les phases et événements Wyckoff clés sur les données OHLCV.
+
+    Événements détectés :
+    - Spring (Accumulation)       : faux cassage sous le support → retournement haussier
+    - Selling Climax / SC         : bougie baissière large + volume élevé aux bas → épuisement vendeurs
+    - Upthrust / UT               : faux cassage au-dessus de la résistance → retournement baissier
+    - Buying Climax / BC          : bougie haussière large + volume élevé aux hauts → épuisement acheteurs
+    - Sign of Strength / SOS      : cassage de résistance + volume → continuation haussière
+    - Sign of Weakness / SOW      : cassage de support + volume → continuation baissière
+
+    Retourne un dict {'phase', 'event', 'wyckoff_bias': 'BUY'|'SELL'|'NEUTRAL'}
+    """
+    if len(df) < 21:
+        return {'phase': None, 'event': None, 'wyckoff_bias': 'NEUTRAL'}
+
+    close = df['close']
+    high_col = df['high']
+    low_col = df['low']
+    open_col = df['open']
+    volume = df['tick_volume']
+
+    curr_close = close.iloc[-1]
+    curr_open = open_col.iloc[-1]
+    curr_high = high_col.iloc[-1]
+    curr_low = low_col.iloc[-1]
+    curr_volume = volume.iloc[-1]
+
+    # Volume moyen sur 20 bougies (hors bougie courante)
+    avg_volume = volume.iloc[-21:-1].mean()
+    high_volume = curr_volume > avg_volume * 1.5 if avg_volume > 0 else False
+
+    # Range des 20 bougies précédentes
+    recent_high = high_col.iloc[-21:-1].max()
+    recent_low = low_col.iloc[-21:-1].min()
+    trend_range = recent_high - recent_low if recent_high > recent_low else 1e-9
+
+    # Position du prix dans le range (0 = bas, 1 = haut)
+    price_position = max(0.0, min(1.0, (curr_close - recent_low) / trend_range))
+
+    # Caractéristiques de la bougie courante
+    candle_range = curr_high - curr_low
+    atr = indicators.get('ATR') or (trend_range / 10)
+    is_large_candle = candle_range > atr * 1.3
+    is_bullish = curr_close > curr_open
+    is_bearish = curr_close < curr_open
+
+    # Contexte de tendance via EMA
+    ema20 = indicators.get('EMA20')
+    ema50 = indicators.get('EMA50')
+    in_downtrend = bool(ema20 and ema50 and curr_close < ema20 and ema20 < ema50)
+    in_uptrend = bool(ema20 and ema50 and curr_close > ema20 and ema20 > ema50)
+
+    # --- SPRING (Accumulation) ---
+    # La bougie plonge sous le support récent puis remonte au-dessus → shakeout classique
+    if curr_low < recent_low and curr_close > recent_low and is_bullish:
+        return {'phase': 'Accumulation', 'event': 'Spring', 'wyckoff_bias': 'BUY'}
+
+    # --- SELLING CLIMAX (SC) ---
+    # Grande bougie baissière avec volume élevé en bas de range + tendance baissière
+    if price_position < 0.25 and is_bearish and is_large_candle and high_volume and in_downtrend:
+        return {'phase': 'Accumulation', 'event': 'Selling Climax (SC)', 'wyckoff_bias': 'BUY'}
+
+    # --- UPTHRUST (UT / Distribution) ---
+    # La bougie perce au-dessus de la résistance récente puis clôture en dessous → bull trap
+    if curr_high > recent_high and curr_close < recent_high and is_bearish:
+        return {'phase': 'Distribution', 'event': 'Upthrust (UT)', 'wyckoff_bias': 'SELL'}
+
+    # --- BUYING CLIMAX (BC) ---
+    # Grande bougie haussière avec volume élevé en haut de range + tendance haussière
+    if price_position > 0.75 and is_bullish and is_large_candle and high_volume and in_uptrend:
+        return {'phase': 'Distribution', 'event': 'Buying Climax (BC)', 'wyckoff_bias': 'SELL'}
+
+    # --- SIGN OF STRENGTH (SOS) ---
+    # Clôture au-dessus de la résistance récente + volume élevé + tendance haussière
+    if curr_close > recent_high and is_bullish and high_volume and in_uptrend:
+        return {'phase': 'Markup', 'event': 'Sign of Strength (SOS)', 'wyckoff_bias': 'BUY'}
+
+    # --- SIGN OF WEAKNESS (SOW) ---
+    # Clôture en dessous du support récent + volume élevé + tendance baissière
+    if curr_close < recent_low and is_bearish and high_volume and in_downtrend:
+        return {'phase': 'Markdown', 'event': 'Sign of Weakness (SOW)', 'wyckoff_bias': 'SELL'}
+
+    return {'phase': None, 'event': None, 'wyckoff_bias': 'NEUTRAL'}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SMART MONEY CONCEPT (SMC) — LOGIQUE INSTITUTIONNELLE COMPLÈTE
+# ─────────────────────────────────────────────────────────────────────────────
+
+def detect_swing_points(df, window=3):
+    highs, lows = [], []
+    n = len(df)
+    limit = min(n, 50)
+    start = n - limit
+    for i in range(start + window, n - window):
+        h = df['high'].iloc[i]
+        l = df['low'].iloc[i]
+        if all(h >= df['high'].iloc[i - j] for j in range(1, window + 1)) and \
+           all(h >= df['high'].iloc[i + j] for j in range(1, window + 1)):
+            highs.append((i, h))
+        if all(l <= df['low'].iloc[i - j] for j in range(1, window + 1)) and \
+           all(l <= df['low'].iloc[i + j] for j in range(1, window + 1)):
+            lows.append((i, l))
+    return {'highs': highs, 'lows': lows}
+
+
+def detect_market_structure(df):
+    empty = {'trend': 'RANGING', 'bos': None, 'choch': None,
+             'last_swing_high': None, 'last_swing_low': None,
+             'prev_swing_high': None, 'prev_swing_low': None}
+    if len(df) < 20:
+        return empty
+    swings = detect_swing_points(df, window=3)
+    if len(swings['highs']) < 2 or len(swings['lows']) < 2:
+        return empty
+    curr_close = df['close'].iloc[-1]
+    _, last_sh = swings['highs'][-1]
+    _, prev_sh = swings['highs'][-2]
+    _, last_sl = swings['lows'][-1]
+    _, prev_sl = swings['lows'][-2]
+    trend = 'RANGING'
+    if last_sh > prev_sh and last_sl > prev_sl:
+        trend = 'BULLISH'
+    elif last_sh < prev_sh and last_sl < prev_sl:
+        trend = 'BEARISH'
+    bos = None
+    if curr_close > last_sh:
+        bos = 'Bullish BOS'
+    elif curr_close < last_sl:
+        bos = 'Bearish BOS'
+    choch = None
+    if bos == 'Bullish BOS' and trend == 'BEARISH':
+        choch = 'ChoCH Bullish'
+    elif bos == 'Bearish BOS' and trend == 'BULLISH':
+        choch = 'ChoCH Bearish'
+    return {'trend': trend, 'bos': bos, 'choch': choch,
+            'last_swing_high': last_sh, 'last_swing_low': last_sl,
+            'prev_swing_high': prev_sh, 'prev_swing_low': prev_sl}
+
+
+def detect_true_order_block(df, structure):
+    if len(df) < 10 or not structure.get('bos'):
         return None
-
-    distance = abs(current_price - pivot) / max(pivot, 1)
-    if distance > 0.015 and ('Support' in zones or 'Resistance' in zones):
-        return 'FVG Candidate'
-
-    if r1 is not None and abs(current_price - r1) / max(r1, 1) > 0.02:
-        return 'FVG Candidate'
-    if s1 is not None and abs(current_price - s1) / max(s1, 1) > 0.02:
-        return 'FVG Candidate'
-    if r2 is not None and abs(current_price - r2) / max(r2, 1) > 0.02:
-        return 'FVG Candidate'
-    if s2 is not None and abs(current_price - s2) / max(s2, 1) > 0.02:
-        return 'FVG Candidate'
-
+    curr_close = df['close'].iloc[-1]
+    curr_low   = df['low'].iloc[-1]
+    curr_high  = df['high'].iloc[-1]
+    bos        = structure['bos']
+    window     = min(15, len(df) - 2)
+    if bos == 'Bullish BOS':
+        for i in range(-2, -window - 1, -1):
+            if df['close'].iloc[i] < df['open'].iloc[i]:
+                ob_top    = df['high'].iloc[i]
+                ob_bottom = df['low'].iloc[i]
+                mitigated = curr_low < ob_bottom
+                retesting = ob_bottom <= curr_close <= ob_top * 1.002
+                if not mitigated:
+                    return {'type': 'Bullish OB', 'top': ob_top, 'bottom': ob_bottom,
+                            'retesting': retesting, 'mitigated': False}
+                break
+    elif bos == 'Bearish BOS':
+        for i in range(-2, -window - 1, -1):
+            if df['close'].iloc[i] > df['open'].iloc[i]:
+                ob_top    = df['high'].iloc[i]
+                ob_bottom = df['low'].iloc[i]
+                mitigated = curr_high > ob_top
+                retesting = ob_bottom * 0.998 <= curr_close <= ob_top
+                if not mitigated:
+                    return {'type': 'Bearish OB', 'top': ob_top, 'bottom': ob_bottom,
+                            'retesting': retesting, 'mitigated': False}
+                break
     return None
+
+
+def detect_liquidity(df, structure):
+    result = {'bsl': None, 'ssl': None, 'bsl_swept': False, 'ssl_swept': False,
+              'eqh': False, 'eql': False, 'bias': 'NEUTRAL'}
+    if len(df) < 20:
+        return result
+    last_sh = structure.get('last_swing_high')
+    last_sl = structure.get('last_swing_low')
+    prev_sh = structure.get('prev_swing_high')
+    prev_sl = structure.get('prev_swing_low')
+    if not last_sh or not last_sl:
+        return result
+    curr_close = df['close'].iloc[-1]
+    curr_high  = df['high'].iloc[-1]
+    curr_low   = df['low'].iloc[-1]
+    result['bsl'] = last_sh
+    result['ssl'] = last_sl
+    result['bsl_swept'] = curr_high > last_sh and curr_close < last_sh
+    result['ssl_swept'] = curr_low  < last_sl and curr_close > last_sl
+    if prev_sh:
+        result['eqh'] = abs(last_sh - prev_sh) / max(prev_sh, 1e-9) < 0.001
+    if prev_sl:
+        result['eql'] = abs(last_sl - prev_sl) / max(prev_sl, 1e-9) < 0.001
+    if result['ssl_swept']:
+        result['bias'] = 'BUY'
+    elif result['bsl_swept']:
+        result['bias'] = 'SELL'
+    return result
+
+
+def detect_premium_discount(df, structure):
+    last_sh = structure.get('last_swing_high')
+    last_sl = structure.get('last_swing_low')
+    if not last_sh or not last_sl:
+        return {'zone': 'NEUTRAL', 'ote': False, 'price_pct': 50.0, 'fib_level': None}
+    curr_close  = df['close'].iloc[-1]
+    swing_range = last_sh - last_sl
+    if swing_range <= 0:
+        return {'zone': 'NEUTRAL', 'ote': False, 'price_pct': 50.0, 'fib_level': None}
+    price_pct = max(0.0, min(100.0, (curr_close - last_sl) / swing_range * 100))
+    zone      = 'Discount' if price_pct < 50 else ('Premium' if price_pct > 50 else 'Equilibrium')
+    fib_levels = [0, 23.6, 38.2, 50, 61.8, 70.5, 79, 88.2, 100]
+    fib_level  = min(fib_levels, key=lambda x: abs(x - price_pct))
+    trend = structure.get('trend', 'RANGING')
+    ote = False
+    if trend == 'BULLISH' and 20.0 <= price_pct <= 38.2:
+        ote = True
+    elif trend == 'BEARISH' and 61.8 <= price_pct <= 80.0:
+        ote = True
+    return {'zone': zone, 'ote': ote, 'price_pct': round(price_pct, 1), 'fib_level': fib_level}
+
+
+def detect_displacement(df, indicators):
+    if len(df) < 4:
+        return {'detected': False, 'direction': None}
+    atr = indicators.get('ATR')
+    if not atr or atr == 0:
+        return {'detected': False, 'direction': None}
+    c = df['close'].iloc[-1]
+    o = df['open'].iloc[-1]
+    if abs(c - o) > atr * 1.5:
+        return {'detected': True, 'direction': 'BUY' if c > o else 'SELL'}
+    move = abs(df['close'].iloc[-1] - df['open'].iloc[-4])
+    if move > atr * 2.0:
+        direction = 'BUY' if df['close'].iloc[-1] > df['open'].iloc[-4] else 'SELL'
+        return {'detected': True, 'direction': direction}
+    return {'detected': False, 'direction': None}
+
+
+def is_kill_zone():
+    h = datetime.datetime.utcnow().hour
+    if  7 <= h < 10: return {'active': True,  'name': 'London Kill Zone'}
+    if 12 <= h < 15: return {'active': True,  'name': 'New York Kill Zone'}
+    if 15 <= h < 16: return {'active': True,  'name': 'London Close'}
+    if  0 <= h <  4: return {'active': True,  'name': 'Asian Kill Zone'}
+    return {'active': False, 'name': None}
 
 
 def get_target_levels(entry, sl, direction):
@@ -337,34 +611,47 @@ def get_target_levels(entry, sl, direction):
     return None, None, None
 
 
-def choose_levels(current_price, direction, indicators):
+def choose_levels(current_price, direction, indicators, smc_data=None):
     pivot = indicators.get('Pivot.M.Classic.Middle', None)
     r1 = indicators.get('Pivot.M.Classic.R1', None)
     r2 = indicators.get('Pivot.M.Classic.R2', None)
     s1 = indicators.get('Pivot.M.Classic.S1', None)
     s2 = indicators.get('Pivot.M.Classic.S2', None)
-
-    levels = {
-        'pivot': pivot,
-        'r1': r1,
-        'r2': r2,
-        's1': s1,
-        's2': s2
-    }
+    levels    = {'pivot': pivot, 'r1': r1, 'r2': r2, 's1': s1, 's2': s2}
+    atr       = indicators.get('ATR')
+    true_ob   = smc_data.get('true_ob')   if smc_data else None
+    liquidity = smc_data.get('liquidity') if smc_data else None
 
     if direction == 'BUY':
-        supports = [l for l in [s2, s1, pivot] if l is not None and l < current_price]
-        sl = max(supports) if supports else current_price * 0.997
+        if true_ob and true_ob['type'] == 'Bullish OB' and true_ob['bottom'] < current_price:
+            sl = true_ob['bottom'] - (atr * 0.3 if atr else current_price * 0.001)
+        else:
+            supports = [l for l in [s2, s1, pivot] if l is not None and l < current_price]
+            sl = max(supports) if supports else current_price * 0.997
+            if atr and (current_price - sl) < atr:
+                sl = current_price - atr
+        if liquidity and liquidity.get('bsl') and liquidity['bsl'] > current_price:
+            levels['smc_tp_target'] = liquidity['bsl']
+
     elif direction == 'SELL':
-        resistances = [l for l in [r2, r1, pivot] if l is not None and l > current_price]
-        sl = min(resistances) if resistances else current_price * 1.003
+        if true_ob and true_ob['type'] == 'Bearish OB' and true_ob['top'] > current_price:
+            sl = true_ob['top'] + (atr * 0.3 if atr else current_price * 0.001)
+        else:
+            resistances = [l for l in [r2, r1, pivot] if l is not None and l > current_price]
+            sl = min(resistances) if resistances else current_price * 1.003
+            if atr and (sl - current_price) < atr:
+                sl = current_price + atr
+        if liquidity and liquidity.get('ssl') and liquidity['ssl'] < current_price:
+            levels['smc_tp_target'] = liquidity['ssl']
+
     else:
         sl = None
 
     return sl, levels
 
 
-def format_pair_message(pair, direction, score, rationale, entry, sl, t1, t2, t3, current_price):
+def format_pair_message(pair, direction, score, rationale, entry, sl, t1, t2, t3,
+                        current_price, pd_info=None, kz_info=None):
     direction_icon = '🟢' if direction == 'BUY' else '🔴'
     if direction == 'NEUTRAL':
         return (
@@ -373,15 +660,30 @@ def format_pair_message(pair, direction, score, rationale, entry, sl, t1, t2, t3
             f"<b>Raison:</b> {rationale}"
         )
 
+    sl_dist = abs(sl - entry) or 1e-9
     rr1 = abs(t1 - entry)
     rr2 = abs(t2 - entry)
     rr3 = abs(t3 - entry)
+
+    zone_line = ''
+    if pd_info and pd_info.get('zone') not in (None, 'NEUTRAL'):
+        zone_icon = '🔵' if pd_info['zone'] == 'Discount' else '🔴'
+        ote_str   = ' ✨ <b>OTE</b>' if pd_info.get('ote') else ''
+        zone_line = (f"\n<b>Zone SMC:</b> {zone_icon} {pd_info['zone']} "
+                     f"({pd_info['price_pct']:.1f}% | Fib {pd_info['fib_level']}%){ote_str}")
+
+    kz_line = ''
+    if kz_info and kz_info.get('active'):
+        kz_line = f"\n<b>⏰ Kill Zone:</b> {kz_info['name']}"
+
     return (
         f"<b>{pair} {direction_icon} {direction}</b> — <i>{score}/100</i>\n"
         f"<b>Entrée:</b> <code>{entry:.5f}</code>\n"
         f"<b>SL:</b> <code>{sl:.5f}</code>\n"
         f"<b>TP1:</b> <code>{t1:.5f}</code> | <b>TP2:</b> <code>{t2:.5f}</code> | <b>TP3:</b> <code>{t3:.5f}</code>\n"
-        f"<b>R/R:</b> 1:{rr1/abs(sl-entry):.1f} | 2:{rr2/abs(sl-entry):.1f} | 3:{rr3/abs(sl-entry):.1f}\n"
+        f"<b>R/R:</b> 1:{rr1/sl_dist:.1f} | 2:{rr2/sl_dist:.1f} | 3:{rr3/sl_dist:.1f}"
+        f"{zone_line}"
+        f"{kz_line}\n"
         f"<b>Confluence:</b> {rationale}"
     )
 
@@ -414,19 +716,85 @@ def compute_pair_score(pair_results):
 
     bonus = 0
     if any(r['psych'] for r in pair_results):
-        bonus += 10
-    if any(r['ob'] for r in pair_results):
-        bonus += 12
-    if any(r['zones'] for r in pair_results):
-        bonus += 10
-    if any(r['fvg'] for r in pair_results):
         bonus += 8
+    if any(r['ob'] for r in pair_results):
+        bonus += 6
+    if any(r['zones'] for r in pair_results):
+        bonus += 6
+    if any(r['fvg'] for r in pair_results):
+        bonus += 5
+
+    wyckoff_aligned = [r['wyckoff'] for r in pair_results
+                       if r.get('wyckoff') and r['wyckoff']['wyckoff_bias'] == direction]
+    wyckoff_opposed = [r['wyckoff'] for r in pair_results
+                       if r.get('wyckoff') and r['wyckoff']['wyckoff_bias'] not in ('NEUTRAL', direction)]
+    if wyckoff_aligned:
+        bonus += 12
+
+    bos_aligned = [r['structure'] for r in pair_results
+                   if r.get('structure') and (
+                       (r['structure'].get('bos') == 'Bullish BOS' and direction == 'BUY') or
+                       (r['structure'].get('bos') == 'Bearish BOS' and direction == 'SELL'))]
+    choch_aligned = [r['structure'] for r in pair_results
+                     if r.get('structure') and (
+                         (r['structure'].get('choch') == 'ChoCH Bullish' and direction == 'BUY') or
+                         (r['structure'].get('choch') == 'ChoCH Bearish' and direction == 'SELL'))]
+    if bos_aligned:
+        bonus += 10
+    if choch_aligned:
+        bonus += 15
+
+    liq_aligned = [r['liquidity'] for r in pair_results
+                   if r.get('liquidity') and r['liquidity'].get('bias') == direction]
+    liq_opposed = [r['liquidity'] for r in pair_results
+                   if r.get('liquidity') and r['liquidity'].get('bias') not in ('NEUTRAL', direction)
+                   and r['liquidity'].get('bias')]
+    if liq_aligned:
+        bonus += 12
+
+    true_ob_aligned = [r['true_ob'] for r in pair_results
+                       if r.get('true_ob') and (
+                           (r['true_ob']['type'] == 'Bullish OB' and direction == 'BUY') or
+                           (r['true_ob']['type'] == 'Bearish OB' and direction == 'SELL'))]
+    if true_ob_aligned:
+        bonus += 10
+        if any(ob.get('retesting') for ob in true_ob_aligned):
+            bonus += 5
+
+    pd_correct = [r['premium_discount'] for r in pair_results
+                  if r.get('premium_discount') and (
+                      (r['premium_discount']['zone'] == 'Discount' and direction == 'BUY') or
+                      (r['premium_discount']['zone'] == 'Premium' and direction == 'SELL'))]
+    pd_ote     = [r['premium_discount'] for r in pair_results
+                  if r.get('premium_discount') and r['premium_discount'].get('ote')]
+    pd_wrong   = [r['premium_discount'] for r in pair_results
+                  if r.get('premium_discount') and (
+                      (r['premium_discount']['zone'] == 'Premium'  and direction == 'BUY') or
+                      (r['premium_discount']['zone'] == 'Discount' and direction == 'SELL'))]
+    if pd_correct:
+        bonus += 8
+    if pd_ote:
+        bonus += 10
+
+    disp_aligned = [r['displacement'] for r in pair_results
+                    if r.get('displacement') and r['displacement'].get('detected')
+                    and r['displacement'].get('direction') == direction]
+    if disp_aligned:
+        bonus += 8
+
     score += bonus
 
     if any(r['recommendation'] == direction for r in pair_results if direction != 'NEUTRAL'):
         score += 5
     if any(r['recommendation'] == 'NEUTRAL' for r in pair_results):
         score -= 5
+
+    if wyckoff_opposed and not wyckoff_aligned:
+        score -= 10
+    if pd_wrong and not pd_correct:
+        score -= 15
+    if liq_opposed and not liq_aligned:
+        score -= 8
 
     score = max(min(score, 100), 10)
     if direction == 'NEUTRAL' and score > 55:
@@ -454,16 +822,34 @@ def compute_pair_score(pair_results):
     else:
         rationale.append('Pas de consensus clair')
 
-    if any(r['psych'] for r in pair_results):
-        rationale.append('Niveau psychologique')
-    if any(r['ob'] for r in pair_results):
-        rationale.append('Order block présent')
-    if any(r['zones'] for r in pair_results):
-        rationale.append('Confluence S/R')
+    if choch_aligned:
+        rationale.append(f"ChoCH {choch_aligned[0].get('choch', '')}")
+    elif bos_aligned:
+        rationale.append(f"BOS {bos_aligned[0].get('bos', '')}")
+    if liq_aligned:
+        sweep = 'SSL Sweep' if liq_aligned[0].get('ssl_swept') else 'BSL Sweep'
+        eqh_eql = ' [EQL]' if liq_aligned[0].get('eql') else (' [EQH]' if liq_aligned[0].get('eqh') else '')
+        rationale.append(f"Liquidité {sweep}{eqh_eql}")
+    if true_ob_aligned:
+        retest_str = ' (retest)' if true_ob_aligned[0].get('retesting') else ' (frais)'
+        ob_label   = 'OB Haussier' if true_ob_aligned[0]['type'] == 'Bullish OB' else 'OB Baissier'
+        rationale.append(f"Order Block {ob_label}{retest_str}")
+    if pd_ote:
+        rationale.append(f"OTE {pd_ote[0]['price_pct']:.1f}% (Fib {pd_ote[0]['fib_level']}%)")
+    elif pd_correct:
+        rationale.append(f"Zone {pd_correct[0]['zone']} ({pd_correct[0]['price_pct']:.1f}%)")
+    if wyckoff_aligned:
+        rationale.append(f"Wyckoff {wyckoff_aligned[0]['event']}")
+    if disp_aligned:
+        rationale.append('Displacement institutionnel')
     if any(r['fvg'] for r in pair_results):
         rationale.append('FVG')
+    if any(r['psych'] for r in pair_results):
+        rationale.append('Niveau psychologique')
+    if pd_wrong and not pd_correct:
+        rationale.append('⚠️ Zone défavorable')
 
-    return direction, score, ' ; '.join(rationale[:3])
+    return direction, score, ' ; '.join(rationale[:5])
 
 
 def scan_signals_headless():
@@ -502,18 +888,23 @@ def scan_signals_headless():
                 current_price = indicators['close']
                 last_indicators = indicators
                 last_current_price = current_price
-                psych = is_psychological_level(current_price, pair)
-                zones = detect_support_resistance(current_price, indicators)
-                ob = detect_order_block(indicators, current_price, zones)
-                fvg = detect_fvg(current_price, indicators, zones)
+                psych        = is_psychological_level(current_price, pair)
+                zones        = detect_support_resistance(current_price, indicators)
+                ob           = detect_order_block(indicators, current_price, zones)
+                fvg          = detect_fvg(current_price, indicators, zones)
+                wyckoff      = detect_wyckoff_phase(df, indicators)
+                structure    = detect_market_structure(df)
+                true_ob      = detect_true_order_block(df, structure)
+                liquidity    = detect_liquidity(df, structure)
+                premium_disc = detect_premium_discount(df, structure)
+                displacement = detect_displacement(df, indicators)
 
                 pair_results.append({
-                    'tf': tf,
-                    'recommendation': recommendation,
-                    'psych': psych,
-                    'ob': ob,
-                    'zones': zones,
-                    'fvg': fvg
+                    'tf': tf, 'recommendation': recommendation,
+                    'psych': psych, 'ob': ob, 'zones': zones, 'fvg': fvg,
+                    'wyckoff': wyckoff, 'structure': structure, 'true_ob': true_ob,
+                    'liquidity': liquidity, 'premium_discount': premium_disc,
+                    'displacement': displacement
                 })
 
                 time.sleep(API_REQUEST_DELAY)
@@ -523,18 +914,51 @@ def scan_signals_headless():
                 continue
 
             direction, score, rationale = compute_pair_score(pair_results)
+
+            # Collect best SMC data (needed for SL/TP AND historical adjustment)
+            best_true_ob   = next((r['true_ob']  for r in pair_results if r.get('true_ob')),  None)
+            best_liquidity = next((r['liquidity'] for r in pair_results
+                                   if r.get('liquidity') and r['liquidity'].get('bsl')), None)
+            best_pd = next((r['premium_discount'] for r in pair_results
+                            if r.get('premium_discount') and r['premium_discount']['zone'] != 'NEUTRAL'), None)
+
+            # Kill Zone : +5 pts si signal pendant une fenêtre institutionnelle
+            kz = is_kill_zone()
+            if kz['active'] and direction != 'NEUTRAL':
+                score = min(score + 5, 100)
+
+            # Historical adjustment: empirical probability layer from 10 years of data
+            # Boosts/penalises the technical score based on how price has historically
+            # behaved at this level, kill zone, P/D zone, and FVG for this pair.
+            hist_adj = get_historical_adjustment(
+                pair, last_current_price, best_pd, kz,
+                direction, HIST_STATS,
+                has_fvg=any(r['fvg'] for r in pair_results)
+            )
+            if hist_adj != 0:
+                score = max(min(score + hist_adj, 100), 20)
+                logger.info(f"{pair} - Historical adjustment: {hist_adj:+d} → score {score}")
+
             if score < 68:
                 logger.info(f"{pair} - Score {score} below threshold (68)")
                 continue
 
-            logger.info(f"{pair} - SIGNAL DETECTED: {direction} {score}/100")
-            
-            sl, levels = choose_levels(last_current_price, direction, last_indicators)
+            logger.info(f"{pair} - SIGNAL DETECTED: {direction} {score}/100"
+                        + (f" [{kz['name']}]" if kz['active'] else "")
+                        + (f" [hist {hist_adj:+d}]" if hist_adj != 0 else ""))
+
+            sl, levels = choose_levels(last_current_price, direction, last_indicators,
+                                       smc_data={'true_ob': best_true_ob, 'liquidity': best_liquidity})
             if direction == 'NEUTRAL' or sl is None:
-                message = format_pair_message(pair, direction, score, rationale, last_current_price, sl or last_current_price, last_current_price, last_current_price, last_current_price, last_current_price)
+                message = format_pair_message(pair, direction, score, rationale,
+                                              last_current_price, sl or last_current_price,
+                                              last_current_price, last_current_price, last_current_price,
+                                              last_current_price, best_pd, kz)
             else:
                 t1, t2, t3 = get_target_levels(last_current_price, sl, direction)
-                message = format_pair_message(pair, direction, score, rationale, last_current_price, sl, t1, t2, t3, last_current_price)
+                message = format_pair_message(pair, direction, score, rationale,
+                                              last_current_price, sl, t1, t2, t3,
+                                              last_current_price, best_pd, kz)
 
             send_telegram_message(message)
             signals.append(f'{pair}: {direction} score {score}')
