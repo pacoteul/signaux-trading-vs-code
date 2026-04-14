@@ -150,7 +150,7 @@ def is_psychological_level(price, pair):
     }
     pair_levels = levels.get(pair, [])
     for level in pair_levels:
-        if abs(price - level) < 0.001:  # Tolerance
+        if abs(price - level) / max(level, 0.0001) < 0.001:  # Relative tolerance 0.1%
             return True
     return False
 
@@ -173,9 +173,10 @@ def compute_indicators(df):
     indicators['low'] = df['low'].iloc[-1]
     indicators['volume'] = df['tick_volume'].iloc[-1]
 
-    # RSI
+    # RSI — current and previous bar for reversal/divergence detection
     rsi = ta.rsi(df['close'], length=14)
-    indicators['RSI'] = rsi.iloc[-1] if not rsi.empty else 50
+    indicators['RSI'] = float(rsi.iloc[-1]) if len(rsi) > 0 and pd.notna(rsi.iloc[-1]) else 50
+    indicators['RSI_prev'] = float(rsi.iloc[-2]) if len(rsi) > 1 and pd.notna(rsi.iloc[-2]) else 50
 
     # MACD
     macd = ta.macd(df['close'])
@@ -185,16 +186,14 @@ def compute_indicators(df):
     stoch = ta.stoch(df['high'], df['low'], df['close'])
     indicators['Stoch.K'] = stoch['STOCHk_14_3_3'].iloc[-1] if 'STOCHk_14_3_3' in stoch.columns else 50
 
-    # Pivot points - Manual calculation
-    high = df['high'].iloc[-1]
-    low = df['low'].iloc[-1]
-    close = df['close'].iloc[-1]
-    pivot = (high + low + close) / 3
-    r1 = (2 * pivot) - low
-    s1 = (2 * pivot) - high
-    r2 = pivot + (high - low)
-    s2 = pivot - (high - low)
-    
+    # Pivot points — use last COMPLETE candle (iloc[-2]), not the forming one
+    prev = df.iloc[-2] if len(df) >= 2 else df.iloc[-1]
+    pivot = (prev['high'] + prev['low'] + prev['close']) / 3
+    r1 = (2 * pivot) - prev['low']
+    s1 = (2 * pivot) - prev['high']
+    r2 = pivot + (prev['high'] - prev['low'])
+    s2 = pivot - (prev['high'] - prev['low'])
+
     indicators['Pivot.M.Classic.Middle'] = pivot
     indicators['Pivot.M.Classic.R1'] = r1
     indicators['Pivot.M.Classic.S1'] = s1
@@ -205,6 +204,31 @@ def compute_indicators(df):
     adx = ta.adx(df['high'], df['low'], df['close'])
     indicators['ADX'] = adx['ADX_14'].iloc[-1] if 'ADX_14' in adx.columns else 20
 
+    # ATR for volatility-based stop loss
+    atr = ta.atr(df['high'], df['low'], df['close'], length=14)
+    indicators['ATR'] = float(atr.iloc[-1]) if atr is not None and len(atr) > 0 and pd.notna(atr.iloc[-1]) else None
+
+    # EMA trend filter (20 and 50 period)
+    ema20 = ta.ema(df['close'], length=20)
+    ema50 = ta.ema(df['close'], length=50)
+    indicators['EMA20'] = float(ema20.iloc[-1]) if ema20 is not None and len(ema20) > 0 and pd.notna(ema20.iloc[-1]) else None
+    indicators['EMA50'] = float(ema50.iloc[-1]) if ema50 is not None and len(ema50) > 0 and pd.notna(ema50.iloc[-1]) else None
+
+    # Fair Value Gap — genuine 3-candle gap analysis
+    if len(df) >= 3:
+        c1_high = df['high'].iloc[-3]
+        c1_low = df['low'].iloc[-3]
+        c3_high = df['high'].iloc[-1]
+        c3_low = df['low'].iloc[-1]
+        if c3_low > c1_high:
+            indicators['FVG'] = 'Bullish FVG'
+        elif c3_high < c1_low:
+            indicators['FVG'] = 'Bearish FVG'
+        else:
+            indicators['FVG'] = None
+    else:
+        indicators['FVG'] = None
+
     return indicators
 
 
@@ -213,6 +237,9 @@ def compute_recommendation(indicators):
     macd_hist = indicators.get('MACD.hist', 0)
     stoch_k = indicators.get('Stoch.K', 50)
     adx = indicators.get('ADX', 20)
+    close = indicators.get('close')
+    ema20 = indicators.get('EMA20')
+    ema50 = indicators.get('EMA50')
 
     buy_signals = 0
     sell_signals = 0
@@ -231,6 +258,13 @@ def compute_recommendation(indicators):
         buy_signals += 1
     elif stoch_k > 80:
         sell_signals += 1
+
+    # EMA trend alignment: price position relative to both EMAs confirms trend
+    if close and ema20 and ema50:
+        if close > ema20 > ema50:
+            buy_signals += 1
+        elif close < ema20 < ema50:
+            sell_signals += 1
 
     if adx > 25:
         if buy_signals > sell_signals:
@@ -261,22 +295,26 @@ def get_momentum(indicators):
 def detect_order_block(indicators, current_price, zones):
     momentum = get_momentum(indicators)
     rsi = momentum['rsi']
-    macd_hist = momentum['macd_hist']
-    ob = None
+    rsi_prev = indicators.get('RSI_prev', 50)
 
-    strong_support = 'Support' in zones or 'Pivot' in zones
-    strong_resistance = 'Resistance' in zones or 'Pivot' in zones
+    # zones contains strings like 'Support S1', 'Resistance R1', 'Pivot' — use substring match
+    strong_support = any('Support' in z for z in zones) or any('Pivot' in z for z in zones)
+    strong_resistance = any('Resistance' in z for z in zones) or any('Pivot' in z for z in zones)
 
-    if rsi < 35 and (strong_support or macd_hist < 0):
-        ob = 'Bullish OB'
-    elif rsi > 65 and (strong_resistance or macd_hist > 0):
-        ob = 'Bearish OB'
-    elif rsi < 30 and indicators.get('RSI[1]', 50) > rsi:
-        ob = 'Bullish OB'
-    elif rsi > 70 and indicators.get('RSI[1]', 50) < rsi:
-        ob = 'Bearish OB'
+    # Bullish OB: oversold at support zone
+    if rsi < 35 and strong_support:
+        return 'Bullish OB'
+    # Bearish OB: overbought at resistance zone
+    if rsi > 65 and strong_resistance:
+        return 'Bearish OB'
+    # Bullish OB: RSI recovering from oversold (rsi_prev < rsi = RSI rising)
+    if rsi < 40 and rsi_prev < rsi:
+        return 'Bullish OB'
+    # Bearish OB: RSI falling from overbought (rsi_prev > rsi = RSI falling)
+    if rsi > 60 and rsi_prev > rsi:
+        return 'Bearish OB'
 
-    return ob
+    return None
 
 
 def detect_support_resistance(current_price, indicators):
@@ -302,28 +340,8 @@ def detect_support_resistance(current_price, indicators):
 
 
 def detect_fvg(current_price, indicators, zones):
-    pivot = indicators.get('Pivot.M.Classic.Middle', None)
-    r1 = indicators.get('Pivot.M.Classic.R1', None)
-    s1 = indicators.get('Pivot.M.Classic.S1', None)
-    r2 = indicators.get('Pivot.M.Classic.R2', None)
-    s2 = indicators.get('Pivot.M.Classic.S2', None)
-    if pivot is None:
-        return None
-
-    distance = abs(current_price - pivot) / max(pivot, 1)
-    if distance > 0.015 and ('Support' in zones or 'Resistance' in zones):
-        return 'FVG Candidate'
-
-    if r1 is not None and abs(current_price - r1) / max(r1, 1) > 0.02:
-        return 'FVG Candidate'
-    if s1 is not None and abs(current_price - s1) / max(s1, 1) > 0.02:
-        return 'FVG Candidate'
-    if r2 is not None and abs(current_price - r2) / max(r2, 1) > 0.02:
-        return 'FVG Candidate'
-    if s2 is not None and abs(current_price - s2) / max(s2, 1) > 0.02:
-        return 'FVG Candidate'
-
-    return None
+    # Use genuine 3-candle gap analysis pre-calculated in compute_indicators
+    return indicators.get('FVG', None)
 
 
 def get_target_levels(entry, sl, direction):
@@ -352,12 +370,19 @@ def choose_levels(current_price, direction, indicators):
         's2': s2
     }
 
+    atr = indicators.get('ATR')
     if direction == 'BUY':
         supports = [l for l in [s2, s1, pivot] if l is not None and l < current_price]
         sl = max(supports) if supports else current_price * 0.997
+        # Ensure SL is at least 1 ATR below entry to avoid premature stops
+        if atr and (current_price - sl) < atr:
+            sl = current_price - atr
     elif direction == 'SELL':
         resistances = [l for l in [r2, r1, pivot] if l is not None and l > current_price]
         sl = min(resistances) if resistances else current_price * 1.003
+        # Ensure SL is at least 1 ATR above entry to avoid premature stops
+        if atr and (sl - current_price) < atr:
+            sl = current_price + atr
     else:
         sl = None
 
