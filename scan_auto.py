@@ -601,17 +601,33 @@ def is_kill_zone():
 
 
 def get_target_levels(entry, sl, direction):
+    """Day-trading R/R: TP1=2R, TP2=3R, TP3=5R — minimum 1:2 reward."""
     distance = abs(entry - sl)
     if distance == 0:
         return None, None, None
     if direction == 'BUY':
-        return entry + distance, entry + 2 * distance, entry + 3 * distance
+        return entry + distance * 2.0, entry + distance * 3.0, entry + distance * 5.0
     if direction == 'SELL':
-        return entry - distance, entry - 2 * distance, entry - 3 * distance
+        return entry - distance * 2.0, entry - distance * 3.0, entry - distance * 5.0
     return None, None, None
 
 
-def choose_levels(current_price, direction, indicators, smc_data=None):
+# Hard SL cap per pair type (day trading: never risk more than this in pips)
+_SL_MAX_PIPS = {
+    'default': 20,   # EUR/USD, GBP/USD, AUD/USD, NZD/USD, USD/CAD, USD/CHF
+    'jpy':     32,   # All JPY pairs (price ~100-160, pips = 0.01)
+    'exotic':  26,   # GBPNZD, GBPAUD, EURNZD, EURAUD, GBPCHF, GBPCAD
+}
+
+def _max_sl_pips(pair: str) -> int:
+    if 'JPY' in pair:
+        return _SL_MAX_PIPS['jpy']
+    if pair in ('GBPNZD', 'GBPAUD', 'EURNZD', 'EURAUD', 'GBPCHF', 'GBPCAD', 'GBPJPY'):
+        return _SL_MAX_PIPS['exotic']
+    return _SL_MAX_PIPS['default']
+
+
+def choose_levels(current_price, direction, indicators, smc_data=None, pair=''):
     pivot = indicators.get('Pivot.M.Classic.Middle', None)
     r1 = indicators.get('Pivot.M.Classic.R1', None)
     r2 = indicators.get('Pivot.M.Classic.R2', None)
@@ -647,6 +663,22 @@ def choose_levels(current_price, direction, indicators, smc_data=None):
     else:
         sl = None
 
+    # ── Hard SL cap: enforce day-trading pip limit ──────────────────────────
+    # If the OB or pivot-based SL is too far, tighten it.
+    # Prefer ATR × 1.3 if within the cap; otherwise use the hard cap directly.
+    if sl is not None and direction in ('BUY', 'SELL'):
+        pip          = 0.01 if 'JPY' in pair else 0.0001
+        max_dist     = _max_sl_pips(pair) * pip
+        sl_dist      = (current_price - sl) if direction == 'BUY' else (sl - current_price)
+
+        if sl_dist > max_dist:
+            # Tighten: use ATR × 1.3 if it fits, otherwise use the hard cap
+            if atr and atr * 1.3 <= max_dist:
+                tight = atr * 1.3
+            else:
+                tight = max_dist
+            sl = (current_price - tight) if direction == 'BUY' else (current_price + tight)
+
     return sl, levels
 
 
@@ -665,6 +697,10 @@ def format_pair_message(pair, direction, score, rationale, entry, sl, t1, t2, t3
     rr2 = abs(t2 - entry)
     rr3 = abs(t3 - entry)
 
+    # SL distance in pips for transparency
+    pip     = 0.01 if len(pair) >= 6 and pair[3:6] in ('JPY',) or pair[:3] in ('JPY',) or 'JPY' in pair else 0.0001
+    sl_pips = sl_dist / pip
+
     zone_line = ''
     if pd_info and pd_info.get('zone') not in (None, 'NEUTRAL'):
         zone_icon = '🔵' if pd_info['zone'] == 'Discount' else '🔴'
@@ -674,16 +710,21 @@ def format_pair_message(pair, direction, score, rationale, entry, sl, t1, t2, t3
 
     kz_line = ''
     if kz_info and kz_info.get('active'):
-        kz_line = f"\n<b>⏰ Kill Zone:</b> {kz_info['name']}"
+        kz_line = f"\n<b>Kill Zone:</b> {kz_info['name']}"
+
+    # Signal validity: day trade — max 3 hours from now
+    validity = (datetime.datetime.utcnow() + datetime.timedelta(hours=3)).strftime('%H:%M')
 
     return (
         f"<b>{pair} {direction_icon} {direction}</b> — <i>{score}/100</i>\n"
         f"<b>Entrée:</b> <code>{entry:.5f}</code>\n"
-        f"<b>SL:</b> <code>{sl:.5f}</code>\n"
-        f"<b>TP1:</b> <code>{t1:.5f}</code> | <b>TP2:</b> <code>{t2:.5f}</code> | <b>TP3:</b> <code>{t3:.5f}</code>\n"
-        f"<b>R/R:</b> 1:{rr1/sl_dist:.1f} | 2:{rr2/sl_dist:.1f} | 3:{rr3/sl_dist:.1f}"
+        f"<b>SL:</b> <code>{sl:.5f}</code> <i>({sl_pips:.0f} pips)</i>\n"
+        f"<b>TP1:</b> <code>{t1:.5f}</code> ({rr1/sl_dist:.1f}R) | "
+        f"<b>TP2:</b> <code>{t2:.5f}</code> ({rr2/sl_dist:.1f}R) | "
+        f"<b>TP3:</b> <code>{t3:.5f}</code> ({rr3/sl_dist:.1f}R)"
         f"{zone_line}"
         f"{kz_line}\n"
+        f"<b>Valide jusqu'à:</b> {validity} GMT\n"
         f"<b>Confluence:</b> {rationale}"
     )
 
@@ -714,22 +755,25 @@ def compute_pair_score(pair_results):
     total_possible = sum(weight.values())
     score = 20 + int((alignment / total_possible) * 45)
 
+    # ── Confluences — bonus réduit pour éviter l'inflation de score ──────────
+    # Chaque bonus est calibré : seul une vraie confluence institutionnelle
+    # doit faire monter le score. Le total max hors alignment = ~63 pts.
     bonus = 0
     if any(r['psych'] for r in pair_results):
-        bonus += 8
+        bonus += 5   # niveau psychologique proche (était 8)
     if any(r['ob'] for r in pair_results):
-        bonus += 6
+        bonus += 4   # order block classique (était 6)
     if any(r['zones'] for r in pair_results):
-        bonus += 6
+        bonus += 3   # zone S/R (était 6)
     if any(r['fvg'] for r in pair_results):
-        bonus += 5
+        bonus += 3   # Fair Value Gap (était 5)
 
     wyckoff_aligned = [r['wyckoff'] for r in pair_results
                        if r.get('wyckoff') and r['wyckoff']['wyckoff_bias'] == direction]
     wyckoff_opposed = [r['wyckoff'] for r in pair_results
                        if r.get('wyckoff') and r['wyckoff']['wyckoff_bias'] not in ('NEUTRAL', direction)]
     if wyckoff_aligned:
-        bonus += 12
+        bonus += 8   # Wyckoff aligné (était 12)
 
     bos_aligned = [r['structure'] for r in pair_results
                    if r.get('structure') and (
@@ -740,9 +784,9 @@ def compute_pair_score(pair_results):
                          (r['structure'].get('choch') == 'ChoCH Bullish' and direction == 'BUY') or
                          (r['structure'].get('choch') == 'ChoCH Bearish' and direction == 'SELL'))]
     if bos_aligned:
-        bonus += 10
+        bonus += 6   # BOS confirmé (était 10)
     if choch_aligned:
-        bonus += 15
+        bonus += 10  # ChoCH = renversement de structure, signal fort (était 15)
 
     liq_aligned = [r['liquidity'] for r in pair_results
                    if r.get('liquidity') and r['liquidity'].get('bias') == direction]
@@ -750,16 +794,16 @@ def compute_pair_score(pair_results):
                    if r.get('liquidity') and r['liquidity'].get('bias') not in ('NEUTRAL', direction)
                    and r['liquidity'].get('bias')]
     if liq_aligned:
-        bonus += 12
+        bonus += 8   # sweep de liquidité aligné (était 12)
 
     true_ob_aligned = [r['true_ob'] for r in pair_results
                        if r.get('true_ob') and (
                            (r['true_ob']['type'] == 'Bullish OB' and direction == 'BUY') or
                            (r['true_ob']['type'] == 'Bearish OB' and direction == 'SELL'))]
     if true_ob_aligned:
-        bonus += 10
+        bonus += 7   # OB institutionnel aligné (était 10)
         if any(ob.get('retesting') for ob in true_ob_aligned):
-            bonus += 5
+            bonus += 5  # prix actuellement EN RETEST de l'OB → entrée précise
 
     pd_correct = [r['premium_discount'] for r in pair_results
                   if r.get('premium_discount') and (
@@ -772,46 +816,54 @@ def compute_pair_score(pair_results):
                       (r['premium_discount']['zone'] == 'Premium'  and direction == 'BUY') or
                       (r['premium_discount']['zone'] == 'Discount' and direction == 'SELL'))]
     if pd_correct:
-        bonus += 8
+        bonus += 5   # zone P/D correcte (était 8)
     if pd_ote:
-        bonus += 10
+        bonus += 7   # OTE = entrée optimale Fibonacci 61.8-79% (était 10)
 
     disp_aligned = [r['displacement'] for r in pair_results
                     if r.get('displacement') and r['displacement'].get('detected')
                     and r['displacement'].get('direction') == direction]
     if disp_aligned:
-        bonus += 8
+        bonus += 5   # displacement institutionnel (était 8)
 
     score += bonus
 
     if any(r['recommendation'] == direction for r in pair_results if direction != 'NEUTRAL'):
-        score += 5
+        score += 4   # au moins 1 TF confirm la direction (était 5)
     if any(r['recommendation'] == 'NEUTRAL' for r in pair_results):
-        score -= 5
+        score -= 4
 
+    # Pénalités
     if wyckoff_opposed and not wyckoff_aligned:
         score -= 10
     if pd_wrong and not pd_correct:
-        score -= 15
+        score -= 18  # entrer en Premium pour un BUY = faute institutionnelle grave
     if liq_opposed and not liq_aligned:
         score -= 8
+
+    # ── H1 vs M15 conflict: mauvais timing d'entrée intraday ─────────────────
+    tf_map = {r['tf']: r['recommendation'] for r in pair_results}
+    h1_dir  = tf_map.get(Interval.INTERVAL_1_HOUR, 'NEUTRAL')
+    m15_dir = tf_map.get(Interval.INTERVAL_15_MINUTES, 'NEUTRAL')
+    if (h1_dir == 'BUY'  and m15_dir == 'SELL') or \
+       (h1_dir == 'SELL' and m15_dir == 'BUY'):
+        score -= 12  # H1 et M15 s'opposent → pas d'entrée day trading fiable
 
     score = max(min(score, 100), 10)
     if direction == 'NEUTRAL' and score > 55:
         score = 55
-    if direction != 'NEUTRAL' and score < 40:
-        score = 40
+
+    # SUPPRESSION du plancher artificiel (était: score < 40 → 40)
+    # Un signal faible doit rester faible — le plancher gonflait les scores.
 
     major = [r for r in pair_results if r['tf'] in (Interval.INTERVAL_1_DAY, Interval.INTERVAL_4_HOURS, Interval.INTERVAL_1_HOUR)]
-    major_buy = sum(1 for r in major if r['recommendation'] == 'BUY')
+    major_buy  = sum(1 for r in major if r['recommendation'] == 'BUY')
     major_sell = sum(1 for r in major if r['recommendation'] == 'SELL')
-    if direction == 'BUY' and major_buy < 2:
-        score -= 8
-    if direction == 'SELL' and major_sell < 2:
-        score -= 8
+    if direction == 'BUY'  and major_buy  < 2: score -= 10
+    if direction == 'SELL' and major_sell < 2: score -= 10
 
-    score = max(score, 20)
-    if score < 45:
+    score = max(score, 10)
+    if score < 50:
         direction = 'NEUTRAL'
 
     rationale = []
@@ -928,37 +980,54 @@ def scan_signals_headless():
                 score = min(score + 5, 100)
 
             # Historical adjustment: empirical probability layer from 10 years of data
-            # Boosts/penalises the technical score based on how price has historically
-            # behaved at this level, kill zone, P/D zone, and FVG for this pair.
             hist_adj = get_historical_adjustment(
                 pair, last_current_price, best_pd, kz,
                 direction, HIST_STATS,
                 has_fvg=any(r['fvg'] for r in pair_results)
             )
             if hist_adj != 0:
-                score = max(min(score + hist_adj, 100), 20)
+                score = max(min(score + hist_adj, 100), 10)
                 logger.info(f"{pair} - Historical adjustment: {hist_adj:+d} → score {score}")
 
-            if score < 68:
-                logger.info(f"{pair} - Score {score} below threshold (68)")
+            if score < 74:
+                logger.info(f"{pair} - Score {score} below threshold (74)")
                 continue
 
-            logger.info(f"{pair} - SIGNAL DETECTED: {direction} {score}/100"
-                        + (f" [{kz['name']}]" if kz['active'] else "")
-                        + (f" [hist {hist_adj:+d}]" if hist_adj != 0 else ""))
-
+            # ── Compute SL/TP and apply day-trading validation ─────────────
             sl, levels = choose_levels(last_current_price, direction, last_indicators,
-                                       smc_data={'true_ob': best_true_ob, 'liquidity': best_liquidity})
+                                       smc_data={'true_ob': best_true_ob, 'liquidity': best_liquidity},
+                                       pair=pair)
+
             if direction == 'NEUTRAL' or sl is None:
                 message = format_pair_message(pair, direction, score, rationale,
                                               last_current_price, sl or last_current_price,
                                               last_current_price, last_current_price, last_current_price,
                                               last_current_price, best_pd, kz)
             else:
+                pip     = 0.01 if 'JPY' in pair else 0.0001
+                sl_pips = abs(last_current_price - sl) / pip
+                atr_m15 = (last_indicators.get('ATR') or 0) / pip
+
+                # Reject if SL is below minimum noise floor (spread will hit it)
+                if sl_pips < 5:
+                    logger.info(f"{pair} - SKIP: SL {sl_pips:.1f}p too tight (< 5p noise floor)")
+                    continue
+
+                # Reject if TP1 (= 2× SL) exceeds a realistic session range.
+                # M15 ATR × 10 ≈ rough estimate of the full active session range.
+                tp1_pips = sl_pips * 2.0
+                if atr_m15 > 0 and tp1_pips > atr_m15 * 10:
+                    logger.info(f"{pair} - SKIP: TP1 {tp1_pips:.0f}p > est. session range {atr_m15*10:.0f}p")
+                    continue
+
                 t1, t2, t3 = get_target_levels(last_current_price, sl, direction)
                 message = format_pair_message(pair, direction, score, rationale,
                                               last_current_price, sl, t1, t2, t3,
                                               last_current_price, best_pd, kz)
+
+            logger.info(f"{pair} - SIGNAL: {direction} {score}/100"
+                        + (f" [{kz['name']}]" if kz['active'] else "")
+                        + (f" [hist {hist_adj:+d}]" if hist_adj != 0 else ""))
 
             send_telegram_message(message)
             signals.append(f'{pair}: {direction} score {score}')

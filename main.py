@@ -671,23 +671,33 @@ def is_kill_zone():
 
 
 def get_target_levels(entry, sl, direction):
+    """Day-trading R/R: TP1=2R, TP2=3R, TP3=5R — minimum 1:2 reward."""
     distance = abs(entry - sl)
     if distance == 0:
         return None, None, None
     if direction == 'BUY':
-        return entry + distance, entry + 2 * distance, entry + 3 * distance
+        return entry + distance * 2.0, entry + distance * 3.0, entry + distance * 5.0
     if direction == 'SELL':
-        return entry - distance, entry - 2 * distance, entry - 3 * distance
+        return entry - distance * 2.0, entry - distance * 3.0, entry - distance * 5.0
     return None, None, None
 
 
-def choose_levels(current_price, direction, indicators, smc_data=None):
-    """
-    Calcule le Stop Loss et les niveaux clés.
-    Priorité SMC : SL basé sur l'Order Block institutionnel (invalidé si cassé).
-    Fallback     : pivot le plus proche + garde-fou ATR minimum.
-    TP cible SMC : Swing High/Low (zone de liquidité) si disponible.
-    """
+# Hard SL cap per pair type (day trading — never risk more than this in pips)
+_SL_MAX_PIPS = {
+    'default': 20,
+    'jpy':     32,
+    'exotic':  26,
+}
+
+def _max_sl_pips(pair: str) -> int:
+    if 'JPY' in pair:
+        return _SL_MAX_PIPS['jpy']
+    if pair in ('GBPNZD', 'GBPAUD', 'EURNZD', 'EURAUD', 'GBPCHF', 'GBPCAD', 'GBPJPY'):
+        return _SL_MAX_PIPS['exotic']
+    return _SL_MAX_PIPS['default']
+
+
+def choose_levels(current_price, direction, indicators, smc_data=None, pair=''):
     pivot = indicators.get('Pivot.M.Classic.Middle', None)
     r1 = indicators.get('Pivot.M.Classic.R1', None)
     r2 = indicators.get('Pivot.M.Classic.R2', None)
@@ -701,7 +711,6 @@ def choose_levels(current_price, direction, indicators, smc_data=None):
     liquidity = smc_data.get('liquidity') if smc_data else None
 
     if direction == 'BUY':
-        # SMC first : SL sous le bas de l'OB institutionnel (OB invalidé si cassé)
         if true_ob and true_ob['type'] == 'Bullish OB' and true_ob['bottom'] < current_price:
             sl = true_ob['bottom'] - (atr * 0.3 if atr else current_price * 0.001)
         else:
@@ -709,12 +718,10 @@ def choose_levels(current_price, direction, indicators, smc_data=None):
             sl = max(supports) if supports else current_price * 0.997
             if atr and (current_price - sl) < atr:
                 sl = current_price - atr
-        # TP cible SMC : Buy-Side Liquidity (dernier Swing High)
         if liquidity and liquidity.get('bsl') and liquidity['bsl'] > current_price:
             levels['smc_tp_target'] = liquidity['bsl']
 
     elif direction == 'SELL':
-        # SMC first : SL au-dessus du haut de l'OB institutionnel
         if true_ob and true_ob['type'] == 'Bearish OB' and true_ob['top'] > current_price:
             sl = true_ob['top'] + (atr * 0.3 if atr else current_price * 0.001)
         else:
@@ -722,12 +729,20 @@ def choose_levels(current_price, direction, indicators, smc_data=None):
             sl = min(resistances) if resistances else current_price * 1.003
             if atr and (sl - current_price) < atr:
                 sl = current_price + atr
-        # TP cible SMC : Sell-Side Liquidity (dernier Swing Low)
         if liquidity and liquidity.get('ssl') and liquidity['ssl'] < current_price:
             levels['smc_tp_target'] = liquidity['ssl']
 
     else:
         sl = None
+
+    # ── Hard SL cap for day trading ─────────────────────────────────────────
+    if sl is not None and direction in ('BUY', 'SELL'):
+        pip      = 0.01 if 'JPY' in pair else 0.0001
+        max_dist = _max_sl_pips(pair) * pip
+        sl_dist  = (current_price - sl) if direction == 'BUY' else (sl - current_price)
+        if sl_dist > max_dist:
+            tight = (atr * 1.3) if (atr and atr * 1.3 <= max_dist) else max_dist
+            sl = (current_price - tight) if direction == 'BUY' else (current_price + tight)
 
     return sl, levels
 
@@ -742,14 +757,14 @@ def format_pair_message(pair, direction, score, rationale, entry, sl, t1, t2, t3
             f"<b>Raison:</b> {rationale}"
         )
 
-    sl_dist = abs(sl - entry)
-    if sl_dist == 0:
-        sl_dist = 1e-9
+    sl_dist = abs(sl - entry) or 1e-9
     rr1 = abs(t1 - entry)
     rr2 = abs(t2 - entry)
     rr3 = abs(t3 - entry)
 
-    # Zone Premium/Discount + OTE
+    pip     = 0.01 if 'JPY' in pair else 0.0001
+    sl_pips = sl_dist / pip
+
     zone_line = ''
     if pd_info and pd_info.get('zone') not in (None, 'NEUTRAL'):
         zone_icon = '🔵' if pd_info['zone'] == 'Discount' else '🔴'
@@ -757,19 +772,22 @@ def format_pair_message(pair, direction, score, rationale, entry, sl, t1, t2, t3
         zone_line = (f"\n<b>Zone SMC:</b> {zone_icon} {pd_info['zone']} "
                      f"({pd_info['price_pct']:.1f}% | Fib {pd_info['fib_level']}%){ote_str}")
 
-    # Kill Zone
     kz_line = ''
     if kz_info and kz_info.get('active'):
-        kz_line = f"\n<b>⏰ Kill Zone:</b> {kz_info['name']}"
+        kz_line = f"\n<b>Kill Zone:</b> {kz_info['name']}"
+
+    validity = (datetime.datetime.utcnow() + datetime.timedelta(hours=3)).strftime('%H:%M')
 
     return (
         f"<b>{pair} {direction_icon} {direction}</b> — <i>{score}/100</i>\n"
         f"<b>Entrée:</b> <code>{entry:.5f}</code>\n"
-        f"<b>SL:</b> <code>{sl:.5f}</code>\n"
-        f"<b>TP1:</b> <code>{t1:.5f}</code> | <b>TP2:</b> <code>{t2:.5f}</code> | <b>TP3:</b> <code>{t3:.5f}</code>\n"
-        f"<b>R/R:</b> 1:{rr1/sl_dist:.1f} | 2:{rr2/sl_dist:.1f} | 3:{rr3/sl_dist:.1f}"
+        f"<b>SL:</b> <code>{sl:.5f}</code> <i>({sl_pips:.0f} pips)</i>\n"
+        f"<b>TP1:</b> <code>{t1:.5f}</code> ({rr1/sl_dist:.1f}R) | "
+        f"<b>TP2:</b> <code>{t2:.5f}</code> ({rr2/sl_dist:.1f}R) | "
+        f"<b>TP3:</b> <code>{t3:.5f}</code> ({rr3/sl_dist:.1f}R)"
         f"{zone_line}"
         f"{kz_line}\n"
+        f"<b>Valide jusqu'à:</b> {validity} GMT\n"
         f"<b>Confluence:</b> {rationale}"
     )
 
@@ -801,25 +819,22 @@ def compute_pair_score(pair_results):
     score = 20 + int((alignment / total_possible) * 45)
 
     bonus = 0
-    # ── Indicateurs techniques classiques (poids réduit, SMC prend le dessus) ──
     if any(r['psych'] for r in pair_results):
-        bonus += 8
-    if any(r['ob'] for r in pair_results):
-        bonus += 6
-    if any(r['zones'] for r in pair_results):
-        bonus += 6
-    if any(r['fvg'] for r in pair_results):
         bonus += 5
+    if any(r['ob'] for r in pair_results):
+        bonus += 4
+    if any(r['zones'] for r in pair_results):
+        bonus += 3
+    if any(r['fvg'] for r in pair_results):
+        bonus += 3
 
-    # ── Wyckoff ──────────────────────────────────────────────────────────────
     wyckoff_aligned = [r['wyckoff'] for r in pair_results
                        if r.get('wyckoff') and r['wyckoff']['wyckoff_bias'] == direction]
     wyckoff_opposed = [r['wyckoff'] for r in pair_results
                        if r.get('wyckoff') and r['wyckoff']['wyckoff_bias'] not in ('NEUTRAL', direction)]
     if wyckoff_aligned:
-        bonus += 12
+        bonus += 8
 
-    # ── SMC : Market Structure (BOS / ChoCH) ─────────────────────────────────
     bos_aligned = [r['structure'] for r in pair_results
                    if r.get('structure') and (
                        (r['structure'].get('bos') == 'Bullish BOS' and direction == 'BUY') or
@@ -829,30 +844,27 @@ def compute_pair_score(pair_results):
                          (r['structure'].get('choch') == 'ChoCH Bullish' and direction == 'BUY') or
                          (r['structure'].get('choch') == 'ChoCH Bearish' and direction == 'SELL'))]
     if bos_aligned:
-        bonus += 10   # BOS confirme la direction structurelle
+        bonus += 6
     if choch_aligned:
-        bonus += 15   # ChoCH = retournement confirmé = signal institutionnel fort
+        bonus += 10
 
-    # ── SMC : Liquidité institutionnelle (sweeps SSL/BSL) ────────────────────
     liq_aligned = [r['liquidity'] for r in pair_results
                    if r.get('liquidity') and r['liquidity'].get('bias') == direction]
     liq_opposed = [r['liquidity'] for r in pair_results
                    if r.get('liquidity') and r['liquidity'].get('bias') not in ('NEUTRAL', direction)
                    and r['liquidity'].get('bias')]
     if liq_aligned:
-        bonus += 12   # Sweep de liquidité confirme la direction
+        bonus += 8
 
-    # ── SMC : True Order Block institutionnel ────────────────────────────────
     true_ob_aligned = [r['true_ob'] for r in pair_results
                        if r.get('true_ob') and (
                            (r['true_ob']['type'] == 'Bullish OB' and direction == 'BUY') or
                            (r['true_ob']['type'] == 'Bearish OB' and direction == 'SELL'))]
     if true_ob_aligned:
-        bonus += 10   # OB institutionnel non-mitigé
+        bonus += 7
         if any(ob.get('retesting') for ob in true_ob_aligned):
-            bonus += 5  # Retest actif de l'OB = entrée précise
+            bonus += 5
 
-    # ── SMC : Premium / Discount + OTE ───────────────────────────────────────
     pd_correct = [r['premium_discount'] for r in pair_results
                   if r.get('premium_discount') and (
                       (r['premium_discount']['zone'] == 'Discount' and direction == 'BUY') or
@@ -864,48 +876,52 @@ def compute_pair_score(pair_results):
                       (r['premium_discount']['zone'] == 'Premium'  and direction == 'BUY') or
                       (r['premium_discount']['zone'] == 'Discount' and direction == 'SELL'))]
     if pd_correct:
-        bonus += 8    # Dans la bonne zone institutionnelle
+        bonus += 5
     if pd_ote:
-        bonus += 10   # Dans la zone OTE (61.8-79 % Fibonacci) = entrée optimale
+        bonus += 7
 
-    # ── SMC : Displacement (impulsion institutionnelle) ───────────────────────
     disp_aligned = [r['displacement'] for r in pair_results
                     if r.get('displacement') and r['displacement'].get('detected')
                     and r['displacement'].get('direction') == direction]
     if disp_aligned:
-        bonus += 8
+        bonus += 5
 
     score += bonus
 
     if any(r['recommendation'] == direction for r in pair_results if direction != 'NEUTRAL'):
-        score += 5
+        score += 4
     if any(r['recommendation'] == 'NEUTRAL' for r in pair_results):
-        score -= 5
+        score -= 4
 
-    # ── Pénalités institutionnelles ───────────────────────────────────────────
     if wyckoff_opposed and not wyckoff_aligned:
         score -= 10
     if pd_wrong and not pd_correct:
-        score -= 15   # BUY en zone Premium ou SELL en zone Discount = ERREUR institutionnelle
+        score -= 18
     if liq_opposed and not liq_aligned:
-        score -= 8    # La liquidité pousse dans l'autre sens
+        score -= 8
+
+    # H1 vs M15 conflict: entrée intraday impossible
+    tf_map  = {r['tf']: r['recommendation'] for r in pair_results}
+    h1_dir  = tf_map.get(Interval.INTERVAL_1_HOUR, 'NEUTRAL')
+    m15_dir = tf_map.get(Interval.INTERVAL_15_MINUTES, 'NEUTRAL')
+    if (h1_dir == 'BUY' and m15_dir == 'SELL') or \
+       (h1_dir == 'SELL' and m15_dir == 'BUY'):
+        score -= 12
 
     score = max(min(score, 100), 10)
     if direction == 'NEUTRAL' and score > 55:
         score = 55
-    if direction != 'NEUTRAL' and score < 40:
-        score = 40
+
+    # Suppression du plancher artificiel (était: score < 40 → 40)
 
     major = [r for r in pair_results if r['tf'] in (Interval.INTERVAL_1_DAY, Interval.INTERVAL_4_HOURS, Interval.INTERVAL_1_HOUR)]
-    major_buy = sum(1 for r in major if r['recommendation'] == 'BUY')
+    major_buy  = sum(1 for r in major if r['recommendation'] == 'BUY')
     major_sell = sum(1 for r in major if r['recommendation'] == 'SELL')
-    if direction == 'BUY' and major_buy < 2:
-        score -= 8
-    if direction == 'SELL' and major_sell < 2:
-        score -= 8
+    if direction == 'BUY'  and major_buy  < 2: score -= 10
+    if direction == 'SELL' and major_sell < 2: score -= 10
 
-    score = max(score, 20)
-    if score < 45:
+    score = max(score, 10)
+    if score < 50:
         direction = 'NEUTRAL'
 
     rationale = []
@@ -1045,21 +1061,35 @@ def scan_signals():
             has_fvg=any(r['fvg'] for r in pair_results)
         )
         if hist_adj != 0:
-            score = max(min(score + hist_adj, 100), 20)
+            score = max(min(score + hist_adj, 100), 10)
             print(f'{pair} - Historical adjustment: {hist_adj:+d} → score {score}')
 
-        if score < 68:
-            print(f'Skipping {pair}, score {score} below threshold')
+        if score < 74:
+            print(f'Skipping {pair}, score {score} below threshold (74)')
             continue
 
         sl, levels = choose_levels(last_current_price, direction, last_indicators,
-                                   smc_data={'true_ob': best_true_ob, 'liquidity': best_liquidity})
+                                   smc_data={'true_ob': best_true_ob, 'liquidity': best_liquidity},
+                                   pair=pair)
         if direction == 'NEUTRAL' or sl is None:
             message = format_pair_message(pair, direction, score, rationale,
                                           last_current_price, sl or last_current_price,
                                           last_current_price, last_current_price, last_current_price,
                                           last_current_price, best_pd, kz)
         else:
+            pip     = 0.01 if 'JPY' in pair else 0.0001
+            sl_pips = abs(last_current_price - sl) / pip
+            atr_m15 = (last_indicators.get('ATR') or 0) / pip
+
+            if sl_pips < 5:
+                print(f'Skipping {pair}: SL {sl_pips:.1f}p too tight')
+                continue
+
+            tp1_pips = sl_pips * 2.0
+            if atr_m15 > 0 and tp1_pips > atr_m15 * 10:
+                print(f'Skipping {pair}: TP1 {tp1_pips:.0f}p > session range {atr_m15*10:.0f}p')
+                continue
+
             t1, t2, t3 = get_target_levels(last_current_price, sl, direction)
             message = format_pair_message(pair, direction, score, rationale,
                                           last_current_price, sl, t1, t2, t3,
