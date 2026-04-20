@@ -816,27 +816,6 @@ def is_kill_zone():
     return is_quality_session()
 
 
-def is_kill_zone_legacy():
-    """
-    Vérifie si l'heure actuelle correspond à une Kill Zone institutionnelle (GMT).
-
-    Les Kill Zones sont les fenêtres horaires où les institutions entrent massivement
-    en marché, créant les mouvements directionnels les plus fiables :
-
-    - Asian Kill Zone      : 00:00–04:00 GMT  (Tokyo / Asia open)
-    - London Kill Zone     : 07:00–10:00 GMT  (Londres — le plus actif du jour)
-    - New York Kill Zone   : 12:00–15:00 GMT  (overlap London/NY — maximal de volume)
-    - London Close         : 15:00–16:00 GMT  (fermeture Londres = réversions fréquentes)
-
-    Un signal pendant une Kill Zone = confluence temporelle institutionnelle.
-    """
-    h = datetime.datetime.utcnow().hour
-    if  7 <= h < 10: return {'active': True,  'name': 'London Kill Zone'}
-    if 12 <= h < 15: return {'active': True,  'name': 'New York Kill Zone'}
-    if 15 <= h < 16: return {'active': True,  'name': 'London Close'}
-    if  0 <= h <  4: return {'active': True,  'name': 'Asian Kill Zone'}
-    return {'active': False, 'name': None}
-
 
 def get_target_levels(entry, sl, direction):
     """Day-trading R/R: TP1=2R, TP2=3R, TP3=5R — minimum 1:2 reward."""
@@ -1360,112 +1339,11 @@ def scan_signals():
 
     finish_progress()
     mt5.shutdown()
-            mt5_tf = MT5_TIMEFRAMES[tf]
-            df = get_mt5_data(pair, mt5_tf)
-            if df is None or df.empty:
-                print(f"No data for {pair} {tf}")
-                time.sleep(API_REQUEST_DELAY)
-                continue
-
-            indicators = compute_indicators(df)
-            recommendation = compute_recommendation(indicators)
-            current_price = indicators['close']
-            last_indicators = indicators
-            last_current_price = current_price
-            psych        = is_psychological_level(current_price, pair)
-            zones        = detect_support_resistance(current_price, indicators)
-            ob           = detect_order_block(indicators, current_price, zones)
-            fvg          = detect_fvg(current_price, indicators, zones)
-            wyckoff      = detect_wyckoff_phase(df, indicators)
-            structure    = detect_market_structure(df)
-            true_ob      = detect_true_order_block(df, structure)
-            liquidity    = detect_liquidity(df, structure)
-            premium_disc = detect_premium_discount(df, structure)
-            displacement = detect_displacement(df, indicators)
-
-            pair_results.append({
-                'tf': tf, 'recommendation': recommendation,
-                'psych': psych, 'ob': ob, 'zones': zones, 'fvg': fvg,
-                'wyckoff': wyckoff, 'structure': structure, 'true_ob': true_ob,
-                'liquidity': liquidity, 'premium_discount': premium_disc,
-                'displacement': displacement
-            })
-
-            time.sleep(API_REQUEST_DELAY)
-
-        if not pair_results or last_indicators is None:
-            continue
-
-        direction, score, rationale = compute_pair_score(pair_results)
-
-        # Collect best SMC data (needed for SL/TP AND historical adjustment)
-        best_true_ob  = next((r['true_ob']  for r in pair_results if r.get('true_ob')),  None)
-        best_liquidity = next((r['liquidity'] for r in pair_results
-                               if r.get('liquidity') and r['liquidity'].get('bsl')), None)
-        best_pd = next((r['premium_discount'] for r in pair_results
-                        if r.get('premium_discount') and r['premium_discount']['zone'] != 'NEUTRAL'), None)
-
-        # Kill Zone : +5 pts si signal pendant une fenêtre institutionnelle
-        kz = is_kill_zone()
-        if kz['active'] and direction != 'NEUTRAL':
-            score = min(score + 5, 100)
-
-        # Historical adjustment: empirical probability layer from 10 years of data
-        hist_adj = get_historical_adjustment(
-            pair, last_current_price, best_pd, kz,
-            direction, HIST_STATS,
-            has_fvg=any(r['fvg'] for r in pair_results)
-        )
-        if hist_adj != 0:
-            score = max(min(score + hist_adj, 100), 10)
-            print(f'{pair} - Historical adjustment: {hist_adj:+d} → score {score}')
-
-        if score < 74:
-            print(f'Skipping {pair}, score {score} below threshold (74)')
-            continue
-
-        sl, levels = choose_levels(last_current_price, direction, last_indicators,
-                                   smc_data={'true_ob': best_true_ob, 'liquidity': best_liquidity},
-                                   pair=pair)
-        if direction == 'NEUTRAL' or sl is None:
-            message = format_pair_message(pair, direction, score, rationale,
-                                          last_current_price, sl or last_current_price,
-                                          last_current_price, last_current_price, last_current_price,
-                                          last_current_price, best_pd, kz)
-        else:
-            pip     = 0.01 if 'JPY' in pair else 0.0001
-            sl_pips = abs(last_current_price - sl) / pip
-            atr_m15 = (last_indicators.get('ATR') or 0) / pip
-
-            if sl_pips < 5:
-                print(f'Skipping {pair}: SL {sl_pips:.1f}p too tight')
-                continue
-
-            tp1_pips = sl_pips * 2.0
-            if atr_m15 > 0 and tp1_pips > atr_m15 * 10:
-                print(f'Skipping {pair}: TP1 {tp1_pips:.0f}p > session range {atr_m15*10:.0f}p')
-                continue
-
-            t1, t2, t3 = get_target_levels(last_current_price, sl, direction)
-            message = format_pair_message(pair, direction, score, rationale,
-                                          last_current_price, sl, t1, t2, t3,
-                                          last_current_price, best_pd, kz)
-
-        send_telegram_message(message)
-        signals.append(f'{pair}: {direction} score {score}')
-        time.sleep(PAIR_DELAY)
-
-        if pair_index % BATCH_SIZE == 0 and pair_index < total_pairs:
-            root.after(0, lambda: progress_label.config(text=f"Batch {batch_index}/{total_batches} complete. Pause..."))
-            time.sleep(BATCH_DELAY)
-
-    finish_progress()
-    mt5.shutdown()
     if signals:
         summary = '\n'.join(signals)
-        messagebox.showinfo('Scan complete', f'{len(signals)} pairs processed.\n{summary}')
+        messagebox.showinfo('Scan complet', f'{len(signals)} signal(s) envoyé(s).\n{summary}')
     else:
-        messagebox.showinfo('No Signals', 'Aucune paire analysée ou aucun signal.')
+        messagebox.showinfo('Scan complet', 'Aucun signal qualifié (0–3 attendus par session).')
 
 def auto_scan():
     while True:
