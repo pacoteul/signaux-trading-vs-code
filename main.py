@@ -648,7 +648,175 @@ def detect_displacement(df, indicators):
     return {'detected': False, 'direction': None}
 
 
+# ── New SMC advanced functions (shared with scan_auto.py) ────────────────────
+
+def detect_daily_bias(df_d1, df_h4):
+    if df_d1 is None or df_h4 is None or len(df_d1) < 55 or len(df_h4) < 25:
+        return 'NEUTRAL'
+    ema50_d1 = ta.ema(df_d1['close'], length=50)
+    if ema50_d1 is None or pd.isna(ema50_d1.iloc[-1]):
+        return 'NEUTRAL'
+    d1_close = float(df_d1['close'].iloc[-1])
+    d1_ema50 = float(ema50_d1.iloc[-1])
+    d1_hi = df_d1['high'].iloc[-5:]
+    d1_lo = df_d1['low'].iloc[-5:]
+    d1_hh = float(d1_hi.iloc[-1]) > float(d1_hi.iloc[-3])
+    d1_hl = float(d1_lo.iloc[-1]) > float(d1_lo.iloc[-3])
+    d1_lh = float(d1_hi.iloc[-1]) < float(d1_hi.iloc[-3])
+    d1_ll = float(d1_lo.iloc[-1]) < float(d1_lo.iloc[-3])
+    d1_bullish = d1_close > d1_ema50 and d1_hh and d1_hl
+    d1_bearish = d1_close < d1_ema50 and d1_lh and d1_ll
+    ema20_h4 = ta.ema(df_h4['close'], length=20)
+    if ema20_h4 is None or pd.isna(ema20_h4.iloc[-1]):
+        return 'NEUTRAL'
+    h4_close = float(df_h4['close'].iloc[-1])
+    h4_ema20 = float(ema20_h4.iloc[-1])
+    h4_hi = df_h4['high'].iloc[-6:]
+    h4_lo = df_h4['low'].iloc[-6:]
+    h4_hh = float(h4_hi.iloc[-1]) > float(h4_hi.iloc[-3])
+    h4_hl = float(h4_lo.iloc[-1]) > float(h4_lo.iloc[-3])
+    h4_lh = float(h4_hi.iloc[-1]) < float(h4_hi.iloc[-3])
+    h4_ll = float(h4_lo.iloc[-1]) < float(h4_lo.iloc[-3])
+    h4_bullish = h4_close > h4_ema20 and h4_hh and h4_hl
+    h4_bearish = h4_close < h4_ema20 and h4_lh and h4_ll
+    if d1_bullish and h4_bullish: return 'BUY'
+    if d1_bearish and h4_bearish: return 'SELL'
+    return 'NEUTRAL'
+
+
+def detect_fvg_precision(df, pair):
+    if len(df) < 5:
+        return None
+    pip  = 0.01 if 'JPY' in pair else 0.0001
+    curr = float(df['close'].iloc[-1])
+    n    = len(df)
+    for i in range(n - 2, max(n - 16, 1), -1):
+        if i < 2: break
+        a_hi = float(df['high'].iloc[i - 2])
+        a_lo = float(df['low'].iloc[i - 2])
+        c_hi = float(df['high'].iloc[i])
+        c_lo = float(df['low'].iloc[i])
+        if c_lo > a_hi:
+            gap_bottom, gap_top = a_hi, c_lo
+            gap_size = gap_top - gap_bottom
+            if gap_size < pip * 2: continue
+            if curr <= gap_bottom:
+                touched_pct, quality = 0.0, 'A'
+            elif curr <= gap_top:
+                touched_pct = (curr - gap_bottom) / gap_size * 100
+                quality = 'A' if touched_pct < 50 else 'B'
+            else: continue
+            return {'direction': 'BUY', 'quality': quality, 'top': gap_top,
+                    'bottom': gap_bottom, 'touched_pct': round(touched_pct, 1),
+                    'gap_pips': round(gap_size / pip, 1)}
+        elif c_hi < a_lo:
+            gap_top, gap_bottom = a_lo, c_hi
+            gap_size = gap_top - gap_bottom
+            if gap_size < pip * 2: continue
+            if curr >= gap_top:
+                touched_pct, quality = 0.0, 'A'
+            elif curr >= gap_bottom:
+                touched_pct = (gap_top - curr) / gap_size * 100
+                quality = 'A' if touched_pct < 50 else 'B'
+            else: continue
+            return {'direction': 'SELL', 'quality': quality, 'top': gap_top,
+                    'bottom': gap_bottom, 'touched_pct': round(touched_pct, 1),
+                    'gap_pips': round(gap_size / pip, 1)}
+    return None
+
+
+def detect_inducement(df, direction, true_ob):
+    if true_ob is None or len(df) < 10:
+        return {'idm_level': None, 'swept': False, 'quality': None}
+    curr  = float(df['close'].iloc[-1])
+    c_hi  = float(df['high'].iloc[-1])
+    c_lo  = float(df['low'].iloc[-1])
+    ob_top    = true_ob.get('top')
+    ob_bottom = true_ob.get('bottom')
+    if direction == 'BUY':
+        if ob_top is None or ob_top >= curr:
+            return {'idm_level': None, 'swept': False, 'quality': None}
+        idm = None
+        for i in range(len(df) - 2, max(len(df) - 25, 1), -1):
+            lo = float(df['low'].iloc[i])
+            if ob_top < lo < curr:
+                lo_p = float(df['low'].iloc[i-1]) if i > 0 else lo
+                lo_n = float(df['low'].iloc[i+1]) if i < len(df)-1 else lo
+                if lo <= lo_p and lo <= lo_n: idm = lo; break
+        if idm is None: return {'idm_level': None, 'swept': False, 'quality': None}
+        return {'idm_level': round(idm, 5), 'swept': c_lo < idm, 'quality': 'critical'}
+    elif direction == 'SELL':
+        if ob_bottom is None or ob_bottom <= curr:
+            return {'idm_level': None, 'swept': False, 'quality': None}
+        idm = None
+        for i in range(len(df) - 2, max(len(df) - 25, 1), -1):
+            hi = float(df['high'].iloc[i])
+            if curr < hi < ob_bottom:
+                hi_p = float(df['high'].iloc[i-1]) if i > 0 else hi
+                hi_n = float(df['high'].iloc[i+1]) if i < len(df)-1 else hi
+                if hi >= hi_p and hi >= hi_n: idm = hi; break
+        if idm is None: return {'idm_level': None, 'swept': False, 'quality': None}
+        return {'idm_level': round(idm, 5), 'swept': c_hi > idm, 'quality': 'critical'}
+    return {'idm_level': None, 'swept': False, 'quality': None}
+
+
+def calculate_pnr(df, structure):
+    if len(df) < 5 or not structure.get('bos'):
+        return {'pnr': None, 'valid': True, 'retrace_pct': 0.0}
+    bos  = structure['bos']
+    curr = float(df['close'].iloc[-1])
+    last_n  = min(10, len(df))
+    segment = df.iloc[-last_n:]
+    ranges  = segment['high'] - segment['low']
+    max_idx = int(ranges.values.argmax())
+    imp_hi  = float(segment['high'].iloc[max_idx])
+    imp_lo  = float(segment['low'].iloc[max_idx])
+    imp_rng = imp_hi - imp_lo
+    if imp_rng == 0: return {'pnr': None, 'valid': True, 'retrace_pct': 0.0}
+    pnr = (imp_hi + imp_lo) / 2
+    if bos == 'Bullish BOS':
+        retrace_pct = max(0.0, (imp_hi - curr) / imp_rng * 100)
+        valid = curr > pnr
+    elif bos == 'Bearish BOS':
+        retrace_pct = max(0.0, (curr - imp_lo) / imp_rng * 100)
+        valid = curr < pnr
+    else: return {'pnr': None, 'valid': True, 'retrace_pct': 0.0}
+    return {'pnr': round(pnr, 5), 'valid': valid, 'retrace_pct': round(retrace_pct, 1)}
+
+
+def detect_institutional_candle(df):
+    if len(df) < 12: return {'valid': False, 'direction': None, 'body_ratio': 0.0}
+    c, o = float(df['close'].iloc[-1]), float(df['open'].iloc[-1])
+    hi, lo = float(df['high'].iloc[-1]), float(df['low'].iloc[-1])
+    vol = float(df['tick_volume'].iloc[-1])
+    rng = hi - lo
+    if rng == 0: return {'valid': False, 'direction': None, 'body_ratio': 0.0}
+    body_ratio = abs(c - o) / rng
+    avg_vol = float(df['tick_volume'].iloc[-12:-1].mean())
+    high_vol = vol > avg_vol * 1.2
+    if body_ratio < 0.60: return {'valid': False, 'direction': None, 'body_ratio': round(body_ratio, 2)}
+    if c > o and (c - lo) / rng >= 0.75 and high_vol:
+        return {'valid': True, 'direction': 'BUY', 'body_ratio': round(body_ratio, 2)}
+    if c < o and (hi - c) / rng >= 0.75 and high_vol:
+        return {'valid': True, 'direction': 'SELL', 'body_ratio': round(body_ratio, 2)}
+    return {'valid': False, 'direction': None, 'body_ratio': round(body_ratio, 2)}
+
+
+def is_quality_session():
+    h = datetime.datetime.utcnow().hour
+    if  7 <= h <  9: return {'active': True,  'name': 'London Open',  'quality': 'A'}
+    if 13 <= h < 15: return {'active': True,  'name': 'New York Open', 'quality': 'A'}
+    if 15 <= h < 16: return {'active': True,  'name': 'London Close',  'quality': 'B'}
+    if  2 <= h <  4: return {'active': True,  'name': 'Asian Sweep',   'quality': 'B'}
+    return {'active': False, 'name': None, 'quality': None}
+
+
 def is_kill_zone():
+    """Legacy alias."""
+    return is_quality_session()
+
+
+def is_kill_zone_legacy():
     """
     Vérifie si l'heure actuelle correspond à une Kill Zone institutionnelle (GMT).
 
@@ -991,19 +1159,207 @@ def scan_signals():
         root.after(0, lambda: scan_button.config(state='normal'))
         return
 
+    # Gate 1: Session check
+    session = is_quality_session()
+    if not session['active']:
+        finish_progress()
+        mt5.shutdown()
+        messagebox.showinfo('Scan', 'Hors session (London/NY). Aucun signal day trading.')
+        return
+    print(f"Session: {session['name']} Quality {session['quality']}")
+
+    pending = []
     signals = []
-    total_pairs = len(PAIRS)
+    total_pairs   = len(PAIRS)
     total_batches = ceil(total_pairs / BATCH_SIZE)
     pair_index = 0
+
     for pair in PAIRS:
         pair_index += 1
         batch_index = ceil(pair_index / BATCH_SIZE)
         update_progress(pair_index, total_pairs, pair, f"{batch_index}/{total_batches}")
-        pair_results = []
-        last_indicators = None
-        last_recommendation = 'NEUTRAL'
+
+        pair_results       = []
+        dfs                = {}
+        last_indicators    = None
         last_current_price = 0
+
         for tf in TIMEFRAMES:
+            mt5_tf = MT5_TIMEFRAMES[tf]
+            df = get_mt5_data(pair, mt5_tf)
+            if df is None or df.empty:
+                time.sleep(API_REQUEST_DELAY)
+                continue
+
+            dfs[tf] = df
+            indicators     = compute_indicators(df)
+            recommendation = compute_recommendation(indicators)
+            current_price  = indicators['close']
+            last_indicators    = indicators
+            last_current_price = current_price
+
+            psych        = is_psychological_level(current_price, pair)
+            zones        = detect_support_resistance(current_price, indicators)
+            ob           = detect_order_block(indicators, current_price, zones)
+            fvg          = detect_fvg(current_price, indicators, zones)
+            wyckoff      = detect_wyckoff_phase(df, indicators)
+            structure    = detect_market_structure(df)
+            true_ob      = detect_true_order_block(df, structure)
+            liquidity    = detect_liquidity(df, structure)
+            premium_disc = detect_premium_discount(df, structure)
+            displacement = detect_displacement(df, indicators)
+
+            pair_results.append({
+                'tf': tf, 'df': df, 'recommendation': recommendation,
+                'psych': psych, 'ob': ob, 'zones': zones, 'fvg': fvg,
+                'wyckoff': wyckoff, 'structure': structure, 'true_ob': true_ob,
+                'liquidity': liquidity, 'premium_discount': premium_disc,
+                'displacement': displacement
+            })
+            time.sleep(API_REQUEST_DELAY)
+
+        if not pair_results or last_indicators is None:
+            continue
+
+        # Gate 2: Daily Bias
+        df_d1 = dfs.get(Interval.INTERVAL_1_DAY)
+        df_h4 = dfs.get(Interval.INTERVAL_4_HOURS)
+        daily_bias = detect_daily_bias(df_d1, df_h4)
+        if daily_bias == 'NEUTRAL':
+            print(f'{pair} SKIP — no clear daily bias')
+            continue
+
+        direction, score, rationale = compute_pair_score(pair_results)
+
+        # Gate 3: Direction must match daily bias
+        if direction == 'NEUTRAL' or direction != daily_bias:
+            print(f'{pair} SKIP — signal {direction} ≠ bias {daily_bias}')
+            continue
+
+        best_true_ob   = next((r['true_ob']  for r in pair_results if r.get('true_ob')),  None)
+        best_liquidity = next((r['liquidity'] for r in pair_results
+                               if r.get('liquidity') and r['liquidity'].get('bsl')), None)
+        best_pd = next((r['premium_discount'] for r in pair_results
+                        if r.get('premium_discount') and r['premium_discount']['zone'] != 'NEUTRAL'), None)
+
+        df_entry = dfs.get(Interval.INTERVAL_15_MINUTES) or \
+                   dfs.get(Interval.INTERVAL_1_HOUR)     or \
+                   dfs.get(Interval.INTERVAL_4_HOURS)
+
+        # Gate 4: FVG quality (Règle d'Or 50%)
+        fvg_precision = detect_fvg_precision(df_entry, pair) if df_entry is not None else None
+        if fvg_precision is not None:
+            if fvg_precision['direction'] == direction and fvg_precision['quality'] == 'B':
+                score -= 8
+            elif fvg_precision['direction'] != direction:
+                score -= 5
+
+        # Gate 5: Inducement (IDM must be swept)
+        idm = detect_inducement(df_entry, direction, best_true_ob) if df_entry is not None \
+              else {'idm_level': None, 'swept': False, 'quality': None}
+        if idm['idm_level'] is not None and not idm['swept']:
+            print(f'{pair} SKIP — IDM at {idm["idm_level"]:.5f} not swept yet')
+            continue
+        if idm['swept']:
+            score += 8
+            rationale += ' ; IDM Swept'
+
+        # Gate 6: Point de Non-Retour
+        best_structure = next((r['structure'] for r in pair_results
+                               if r.get('structure') and r['structure'].get('bos')), None)
+        pnr = calculate_pnr(df_entry, best_structure) if (df_entry is not None and best_structure) \
+              else {'pnr': None, 'valid': True, 'retrace_pct': 0.0}
+        if not pnr['valid']:
+            print(f'{pair} SKIP — PNR breached ({pnr["retrace_pct"]:.0f}% retraced)')
+            continue
+
+        # Institutional candle quality
+        inst_candle = detect_institutional_candle(df_entry) if df_entry is not None \
+                      else {'valid': False, 'direction': None}
+        if inst_candle['valid'] and inst_candle['direction'] == direction:
+            score += 5
+        elif inst_candle['valid'] and inst_candle['direction'] != direction:
+            score -= 5
+
+        # Session bonus
+        if session['quality'] == 'A':
+            score = min(score + 6, 100)
+        elif session['quality'] == 'B':
+            score = min(score + 3, 100)
+
+        # Historical adjustment
+        hist_adj = get_historical_adjustment(
+            pair, last_current_price, best_pd, session,
+            direction, HIST_STATS,
+            has_fvg=fvg_precision is not None
+        )
+        if hist_adj != 0:
+            score = max(min(score + hist_adj, 100), 10)
+
+        score = max(min(score, 100), 10)
+
+        # Gate 7: Score threshold
+        if score < 78:
+            print(f'{pair} SKIP — score {score} < 78')
+            continue
+
+        # Gate 8: SL/TP validation
+        sl, levels = choose_levels(last_current_price, direction, last_indicators,
+                                   smc_data={'true_ob': best_true_ob, 'liquidity': best_liquidity},
+                                   pair=pair)
+        if sl is None:
+            continue
+
+        pip     = 0.01 if 'JPY' in pair else 0.0001
+        sl_pips = abs(last_current_price - sl) / pip
+        atr_m15 = (last_indicators.get('ATR') or 0) / pip
+
+        if sl_pips < 5:
+            print(f'{pair} SKIP — SL {sl_pips:.1f}p too tight')
+            continue
+
+        tp1_pips = sl_pips * 2.0
+        if atr_m15 > 0 and tp1_pips > atr_m15 * 10:
+            print(f'{pair} SKIP — TP1 {tp1_pips:.0f}p unreachable')
+            continue
+
+        t1, t2, t3 = get_target_levels(last_current_price, sl, direction)
+        if t1 is None:
+            continue
+
+        extra_lines = []
+        if fvg_precision and fvg_precision['direction'] == direction:
+            extra_lines.append(f"FVG Qualité {fvg_precision['quality']} ({fvg_precision['gap_pips']:.0f}p | {fvg_precision['touched_pct']:.0f}% rempli)")
+        if idm['swept']:
+            extra_lines.append(f"IDM Swept ({idm['idm_level']:.5f})")
+        if pnr['pnr']:
+            extra_lines.append(f"PNR {pnr['pnr']:.5f} ({pnr['retrace_pct']:.0f}% retrace)")
+        if extra_lines:
+            rationale = rationale + ' ; ' + ' ; '.join(extra_lines[:2])
+
+        message = format_pair_message(
+            pair, direction, score, rationale,
+            last_current_price, sl, t1, t2, t3,
+            last_current_price, best_pd, session
+        )
+
+        print(f'{pair} CANDIDATE: {direction} {score}/100 | bias={daily_bias} | session={session["name"]}')
+        pending.append({'pair': pair, 'direction': direction, 'score': score, 'message': message})
+
+        if pair_index % BATCH_SIZE == 0 and pair_index < total_pairs:
+            root.after(0, lambda: progress_label.config(text=f"Batch {batch_index}/{total_batches} done. Pause..."))
+            time.sleep(BATCH_DELAY)
+
+    # Send top-3 signals only
+    pending.sort(key=lambda x: x['score'], reverse=True)
+    top = pending[:3]
+    for sig in top:
+        send_telegram_message(sig['message'])
+        signals.append(f"{sig['pair']}: {sig['direction']} {sig['score']}/100")
+        time.sleep(PAIR_DELAY)
+
+    finish_progress()
+    mt5.shutdown()
             mt5_tf = MT5_TIMEFRAMES[tf]
             df = get_mt5_data(pair, mt5_tf)
             if df is None or df.empty:
